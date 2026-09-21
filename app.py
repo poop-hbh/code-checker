@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Веб-версия Code Checker.
+Веб-версия Code Checker. Python + C++.
 Запуск: python app.py
 Открыть: http://127.0.0.1:8000
 """
@@ -17,7 +17,6 @@ from pydantic import BaseModel, Field
 from collections import defaultdict
 from time import time
 
-# Импортируем наш анализатор
 from checker import analyze
 
 
@@ -25,12 +24,11 @@ app = FastAPI(title="Code Checker")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
+    allow_origins=["*"],
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
 
-# ---------- Rate limiting ----------
 RATE_LIMIT = 20
 RATE_WINDOW = 60
 _rate_store = defaultdict(list)
@@ -45,19 +43,18 @@ def check_rate(ip: str) -> bool:
     return True
 
 
-# ---------- Модель запроса ----------
 class CodeRequest(BaseModel):
     code: str = Field(..., min_length=1, max_length=50000)
+    filename: str = Field(default="code.py", max_length=200)
 
 
-# ---------- HTML ----------
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Code Checker</title>
+    <title>Code Checker — Python + C++</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -76,6 +73,28 @@ HTML_PAGE = """
         }
         header h1 { font-size: 24px; margin-bottom: 6px; }
         header p { font-size: 14px; color: #888; }
+        .lang-switch {
+            margin-top: 12px;
+            display: flex;
+            justify-content: center;
+            gap: 8px;
+        }
+        .lang-switch button {
+            padding: 6px 14px;
+            background: #1f1f1f;
+            color: #ccc;
+            border: 1px solid #333;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            margin: 0;
+            font-weight: normal;
+        }
+        .lang-switch button.active {
+            background: #2b5278;
+            color: #fff;
+            border-color: #3a6b9a;
+        }
         main {
             flex: 1;
             max-width: 1100px;
@@ -114,7 +133,7 @@ HTML_PAGE = """
             outline: none;
         }
         textarea:focus { border-color: #4a7ba7; }
-        button {
+        button.check-btn {
             margin-top: 12px;
             padding: 12px;
             background: #2b5278;
@@ -125,8 +144,8 @@ HTML_PAGE = """
             cursor: pointer;
             font-weight: 600;
         }
-        button:hover { background: #3a6b9a; }
-        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        button.check-btn:hover { background: #3a6b9a; }
+        button.check-btn:disabled { opacity: 0.5; cursor: not-allowed; }
         #result {
             flex: 1;
             min-height: 400px;
@@ -143,6 +162,8 @@ HTML_PAGE = """
             border-left: 3px solid #e74c3c;
         }
         .problem.high { background: #2a2a1a; border-left-color: #f1c40f; }
+        .problem.medium { background: #2a201a; border-left-color: #e67e22; }
+        .problem.low { background: #1a1a1a; border-left-color: #95a5a6; }
         .problem .line { color: #888; font-size: 11px; margin-bottom: 4px; }
         .problem .msg { color: #eee; }
         .ok {
@@ -166,19 +187,32 @@ HTML_PAGE = """
             border-radius: 6px;
             color: #e74c3c;
         }
+        .hint {
+            padding: 12px;
+            background: #2a2a1a;
+            border-left: 3px solid #f1c40f;
+            border-radius: 6px;
+            color: #f1c40f;
+            font-size: 13px;
+            margin-bottom: 12px;
+        }
     </style>
 </head>
 <body>
     <header>
         <h1>🔍 Code Checker</h1>
-        <p>Находит 5 критичных проблем в Python-коде</p>
+        <p>60+ проверок: Python + C++ — хардкод, SQL, eval/exec, голые except и другие</p>
+        <div class="lang-switch">
+            <button id="lang-py" class="active" onclick="setLang('py')">Python</button>
+            <button id="lang-cpp" onclick="setLang('cpp')">C++</button>
+        </div>
     </header>
 
     <main>
         <div class="panel">
-            <h2>Вставь свой код:</h2>
-            <textarea id="code" placeholder="Вставь Python-код сюда..." maxlength="50000"></textarea>
-            <button id="check">Проверить</button>
+            <h2 id="input-title">Вставь Python-код:</h2>
+            <textarea id="code" placeholder="Вставь код сюда..." maxlength="50000"></textarea>
+            <button class="check-btn" id="check">Проверить</button>
         </div>
 
         <div class="panel">
@@ -193,6 +227,51 @@ HTML_PAGE = """
         const codeEl = document.getElementById('code');
         const checkBtn = document.getElementById('check');
         const resultEl = document.getElementById('result');
+        const inputTitle = document.getElementById('input-title');
+        const langPy = document.getElementById('lang-py');
+        const langCpp = document.getElementById('lang-cpp');
+
+        let currentLang = 'py';
+        let currentFilename = 'code.py';
+
+        function setLang(lang) {
+            currentLang = lang;
+            if (lang === 'py') {
+                currentFilename = 'code.py';
+                inputTitle.textContent = 'Вставь Python-код:';
+                codeEl.placeholder = 'Вставь Python-код сюда...';
+                langPy.classList.add('active');
+                langCpp.classList.remove('active');
+            } else {
+                currentFilename = 'code.cpp';
+                inputTitle.textContent = 'Вставь C++-код:';
+                codeEl.placeholder = 'Вставь C++-код сюда...';
+                langCpp.classList.add('active');
+                langPy.classList.remove('active');
+            }
+        }
+
+        function detectLang(text) {
+            const head = text.substring(0, 500);
+            if (head.includes('#include') || head.includes('std::') ||
+                head.includes('using namespace') || head.includes('cout <<') ||
+                head.includes('cin >>')) {
+                return 'cpp';
+            }
+            if (head.includes('def ') || head.includes('import ') ||
+                head.includes('print(') || head.includes('class ') && head.includes(':')) {
+                return 'py';
+            }
+            return null;
+        }
+
+        codeEl.addEventListener('input', function() {
+            const text = codeEl.value;
+            const detected = detectLang(text);
+            if (detected && detected !== currentLang) {
+                setLang(detected);
+            }
+        });
 
         async function checkCode() {
             const code = codeEl.value.trim();
@@ -208,7 +287,7 @@ HTML_PAGE = """
                 const res = await fetch('/check', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({code: code})
+                    body: JSON.stringify({code: code, filename: currentFilename})
                 });
 
                 if (res.status === 429) {
@@ -216,7 +295,7 @@ HTML_PAGE = """
                     return;
                 }
                 if (res.status === 422) {
-                    resultEl.innerHTML = '<div class="error">Код слишком длинный (макс. 50 000 символов) или пустой.</div>';
+                    resultEl.innerHTML = '<div class="error">Код слишком длинный или пустой.</div>';
                     return;
                 }
                 if (!res.ok) {
@@ -227,6 +306,18 @@ HTML_PAGE = """
                 const data = await res.json();
 
                 if (data.error) {
+                    // Если синтаксическая ошибка Python, но код похож на C++ — подсказка
+                    if (data.error.includes('Синтаксическая ошибка') && currentLang === 'py') {
+                        const detected = detectLang(code);
+                        if (detected === 'cpp') {
+                            setLang('cpp');
+                            resultEl.innerHTML =
+                                '<div class="hint">Похоже, это C++-код. Я переключил язык на C++. ' +
+                                'Проверьте ещё раз.</div>';
+                            checkBtn.disabled = false;
+                            return;
+                        }
+                    }
                     resultEl.innerHTML = '<div class="error">' + escapeHtml(data.error) + '</div>';
                     return;
                 }
@@ -238,8 +329,16 @@ HTML_PAGE = """
 
                 let html = '<div class="summary">Найдено проблем: ' + data.problems.length + '</div>';
                 for (const p of data.problems) {
-                    const cls = p.severity === 'CRITICAL' ? 'problem' : 'problem high';
-                    const marker = p.severity === 'CRITICAL' ? '🔴' : '🟡';
+                    let cls = 'problem';
+                    if (p.severity === 'HIGH') cls = 'problem high';
+                    else if (p.severity === 'MEDIUM') cls = 'problem medium';
+                    else if (p.severity === 'LOW') cls = 'problem low';
+
+                    let marker = '🔴';
+                    if (p.severity === 'HIGH') marker = '🟡';
+                    else if (p.severity === 'MEDIUM') marker = '🟠';
+                    else if (p.severity === 'LOW') marker = '⚪';
+
                     html += '<div class="' + cls + '">';
                     html += '<div class="line">' + marker + ' Строка ' + p.line + '</div>';
                     html += '<div class="msg">' + escapeHtml(p.message) + '</div>';
@@ -267,7 +366,6 @@ HTML_PAGE = """
 """
 
 
-# ---------- Эндпоинты ----------
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_PAGE
@@ -280,7 +378,6 @@ async def health():
 
 @app.post("/check")
 async def check_code(payload: CodeRequest, request: Request):
-    # Rate limit
     client_ip = request.client.host if request.client else "unknown"
     if not check_rate(client_ip):
         raise HTTPException(status_code=429, detail="Too many requests")
@@ -289,20 +386,26 @@ async def check_code(payload: CodeRequest, request: Request):
     if not code.strip():
         return {"problems": [], "error": "Пустой код"}
 
-    # Проверяем синтаксис до анализа
-    try:
-        ast.parse(code)
-    except SyntaxError as e:
-        return {
-            "problems": [],
-            "error": f"Синтаксическая ошибка: строка {e.lineno}, {e.msg}"
-        }
+    filename = payload.filename or "code.py"
+    if filename.endswith(".py"):
+        try:
+            ast.parse(code)
+        except SyntaxError as e:
+            return {
+                "problems": [],
+                "error": f"Синтаксическая ошибка: строка {e.lineno}, {e.msg}"
+            }
+        except RecursionError:
+            return {
+                "problems": [],
+                "error": "Слишком сложный код (глубокая рекурсия)."
+            }
 
-    # Сохраняем во временный файл и анализируем
+    suffix = ".cpp" if filename.endswith((".cpp", ".cc", ".cxx", ".c", ".h", ".hpp")) else ".py"
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, encoding="utf-8"
+            mode="w", suffix=suffix, delete=False, encoding="utf-8"
         ) as f:
             f.write(code)
             tmp_path = f.name
@@ -325,6 +428,5 @@ async def check_code(payload: CodeRequest, request: Request):
                 pass
 
 
-# ---------- Запуск ----------
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
