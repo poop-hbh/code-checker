@@ -306,7 +306,6 @@ HTML_PAGE = """
                 const data = await res.json();
 
                 if (data.error) {
-                    // Если синтаксическая ошибка Python, но код похож на C++ — подсказка
                     if (data.error.includes('Синтаксическая ошибка') && currentLang === 'py') {
                         const detected = detectLang(code);
                         if (detected === 'cpp') {
@@ -424,8 +423,8 @@ async def check_code(payload: CodeRequest, request: Request):
         if tmp_path and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
-            except OSError:
-                pass
+            except OSError as e:
+                print(f"[WARN] Не удалось удалить временный файл: {e}")
 
 
 if __name__ == "__main__":
