@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Анализатор кода. Python + C++.
+Анализатор кода. Python + C++ + HTML + JavaScript.
 Запуск: python checker.py <файл>
 
-Версия 6.2:
-- Автоопределение языка (Python / C++)
-- Python: 28 проверок
-- C++: 30+ проверок
-- Все длинные строки разбиты
+Версия 7.0:
+- Python (28 проверок)
+- C++ (30+ проверок)
+- HTML (10+ проверок)
+- JavaScript (15+ проверок)
+- Автоопределение языка
 """
 
 import ast
@@ -35,6 +36,7 @@ SAFE_VALUES = {
     "", "none", "null",
 }
 
+# --- Python ---
 PY_SQL_PATTERNS = [
     (r'execute\s*\(\s*f["\']', "SQL через f-строку"),
     (r'execute\s*\(\s*["\'][^"\']*["\']\s*\+', "SQL через конкатенацию"),
@@ -70,6 +72,7 @@ PY_TODO_PATTERNS = [
     (r'#\s*HACK\b', "HACK"),
 ]
 
+# --- C++ ---
 CPP_SQL_PATTERNS = [
     (r'sprintf\s*\([^,]+,\s*"[^"]*%s[^"]*SELECT', "SQL через sprintf"),
     (r'sprintf\s*\([^,]+,\s*"[^"]*%s[^"]*(INSERT|UPDATE|DELETE)', "SQL через sprintf"),
@@ -82,7 +85,7 @@ CPP_DANGEROUS_FUNCS = {
 }
 
 CPP_UNSAFE_PATTERNS = [
-    (r'\bgets\s*\(', "`gets()` — опасно (переполнение буфера)"),
+    (r'\bgets\s*\(', "`gets()` — опасно (переполнение)"),
     (r'\bstrcpy\s*\(', "`strcpy()` — опасно (переполнение)"),
     (r'\bstrcat\s*\(', "`strcat()` — опасно (переполнение)"),
     (r'\bsprintf\s*\(', "`sprintf()` — опасно (переполнение)"),
@@ -106,6 +109,33 @@ CPP_STYLE_PATTERNS = [
     (r'\bprintf\s*\(', "`printf` вместо `std::cout`", "LOW"),
     (r'\bNULL\b', "`NULL` вместо `nullptr`", "LOW"),
     (r'\bvoid\s+main\s*\(', "`void main()` — нужно `int main()`", "HIGH"),
+]
+
+# --- HTML ---
+HTML_PATTERNS = [
+    (r'<script[^>]*>.*?eval\s*\(', "`<script>` с `eval()` — XSS", "CRITICAL", re.IGNORECASE | re.DOTALL),
+    (r'on\w+\s*=\s*["\'][^"\']*eval\s*\(', "`onclick=\"eval()\"` — XSS", "CRITICAL", re.IGNORECASE),
+    (r'<iframe(?![^>]*sandbox)[^>]*>', "`<iframe>` без `sandbox`", "HIGH", re.IGNORECASE),
+    (r'<marquee\b', "`<marquee>` — устаревший тег", "LOW", re.IGNORECASE),
+    (r'<blink\b', "`<blink>` — устаревший тег", "LOW", re.IGNORECASE),
+    (r'<font\b', "`<font>` — устаревший тег", "LOW", re.IGNORECASE),
+    (r'<center\b', "`<center>` — устаревший тег", "LOW", re.IGNORECASE),
+    (r'document\.write\s*\(', "`document.write()` — плохо", "MEDIUM", re.IGNORECASE),
+    (r'innerHTML\s*=', "`innerHTML` — XSS", "HIGH", re.IGNORECASE),
+]
+
+# --- JavaScript ---
+JS_PATTERNS = [
+    (r'\beval\s*\(', "`eval()` — опасно (RCE)", "CRITICAL"),
+    (r'\bFunction\s*\(', "`Function()` — опасно (как eval)", "CRITICAL"),
+    (r'\bnew\s+Function\s*\(', "`new Function()` — опасно", "CRITICAL"),
+    (r'document\.write\s*\(', "`document.write()` — плохо", "MEDIUM"),
+    (r'innerHTML\s*=', "`innerHTML` — XSS", "HIGH"),
+    (r'outerHTML\s*=', "`outerHTML` — XSS", "HIGH"),
+    (r'insertAdjacentHTML\s*\(', "`insertAdjacentHTML` — XSS", "HIGH"),
+    (r'\bvar\s+\w+', "`var` вместо `let`/`const`", "LOW"),
+    (r'console\.log\s*\(', "`console.log` в проде", "LOW"),
+    (r'debugger\s*;', "`debugger` в коде", "MEDIUM"),
 ]
 
 
@@ -156,10 +186,18 @@ def _detect_language(source, filepath):
         return "cpp"
     if ext == ".py":
         return "python"
+    if ext in (".html", ".htm"):
+        return "html"
+    if ext in (".js", ".mjs"):
+        return "js"
 
-    head = source[:500]
+    head = source[:500].lower()
     if "#include" in head or "std::" in head or "using namespace" in head:
         return "cpp"
+    if "<!doctype html" in head or "<html" in head:
+        return "html"
+    if "function " in head or "const " in head or "let " in head or "var " in head:
+        return "js"
     if "def " in head or "import " in head:
         return "python"
 
@@ -175,13 +213,11 @@ def _deduplicate(problems):
             seen.add(key)
             unique.append(p)
     severity_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
-    unique.sort(
-        key=lambda p: (severity_order.get(p["severity"], 99), p["line"])
-    )
+    unique.sort(key=lambda p: (severity_order.get(p["severity"], 99), p["line"]))
     return unique
 
 
-# ============ PYTHON: AST ============
+# ============ PYTHON ============
 
 class PythonChecker(ast.NodeVisitor):
     def __init__(self):
@@ -190,11 +226,7 @@ class PythonChecker(ast.NodeVisitor):
         self.used_names = set()
 
     def add(self, line_no, severity, message):
-        self.problems.append({
-            "line": line_no,
-            "severity": severity,
-            "message": message,
-        })
+        self.problems.append({"line": line_no, "severity": severity, "message": message})
 
     def visit_Try(self, node):
         for handler in node.handlers:
@@ -264,8 +296,7 @@ class PythonChecker(ast.NodeVisitor):
             name = alias.asname or alias.name.split(".")[0]
             self.imports.append((name, node.lineno))
             if alias.name == "*":
-                self.add(node.lineno, "MEDIUM",
-                         "`import *` — неясно, что импортируется.")
+                self.add(node.lineno, "MEDIUM", "`import *` — неясно.")
         self.generic_visit(node)
 
     def visit_ImportFrom(self, node):
@@ -273,8 +304,7 @@ class PythonChecker(ast.NodeVisitor):
             name = alias.asname or alias.name
             self.imports.append((name, node.lineno))
             if alias.name == "*":
-                self.add(node.lineno, "MEDIUM",
-                         "`from ... import *` — неясно, что импортируется.")
+                self.add(node.lineno, "MEDIUM", "`from ... import *` — неясно.")
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node):
@@ -301,16 +331,14 @@ class PythonChecker(ast.NodeVisitor):
                          f"`global {', '.join(child.names)}` — избегай.")
 
     def visit_Assert(self, node):
-        self.add(node.lineno, "HIGH",
-                 "`assert` может быть отключён (флаг `-O`).")
+        self.add(node.lineno, "HIGH", "`assert` может быть отключён.")
         self.generic_visit(node)
 
     def visit_Lambda(self, node):
         body = node.body
         if isinstance(body, (ast.IfExp, ast.Compare, ast.BoolOp,
                               ast.ListComp, ast.DictComp, ast.SetComp)):
-            self.add(node.lineno, "MEDIUM",
-                     "`lambda` со сложной логикой — используй функцию.")
+            self.add(node.lineno, "MEDIUM", "`lambda` со сложной логикой.")
         self.generic_visit(node)
 
     def visit_While(self, node):
@@ -321,8 +349,7 @@ class PythonChecker(ast.NodeVisitor):
                     has_break = True
                     break
             if not has_break:
-                self.add(node.lineno, "MEDIUM",
-                         "`while True:` без `break` — бесконечный цикл?")
+                self.add(node.lineno, "MEDIUM", "`while True:` без `break`.")
         self.generic_visit(node)
 
     def visit_If(self, node):
@@ -335,24 +362,30 @@ class PythonChecker(ast.NodeVisitor):
         self.generic_visit(node)
 
     def _check_name(self, test, node):
+        # Только `==`, не `!=`
+        if not (test.ops and isinstance(test.ops[0], ast.Eq)):
+            return
         if isinstance(test.left, ast.Name) and test.left.id == "__name__":
             for comp in test.comparators:
                 if not (isinstance(comp, ast.Constant) and comp.value == "__main__"):
-                    self.add(node.lineno, "HIGH",
-                             "`__name__` сравнивается не с `__main__`.")
+                    self.add(node.lineno, "HIGH", "`__name__` не с `__main__`.")
 
     def _check_none(self, test, node):
-        if test.ops and isinstance(test.ops[0], ast.Eq):
+        if not test.ops:
+            return
+        if isinstance(test.ops[0], ast.Eq):
             for comp in test.comparators:
                 if isinstance(comp, ast.Constant) and comp.value is None:
                     self.add(node.lineno, "HIGH", "`== None` — используй `is None`.")
-        if test.ops and isinstance(test.ops[0], ast.NotEq):
+        if isinstance(test.ops[0], ast.NotEq):
             for comp in test.comparators:
                 if isinstance(comp, ast.Constant) and comp.value is None:
                     self.add(node.lineno, "HIGH", "`!= None` — используй `is not None`.")
 
     def _check_bool(self, test, node):
-        if test.ops and isinstance(test.ops[0], ast.Eq):
+        if not test.ops:
+            return
+        if isinstance(test.ops[0], ast.Eq):
             for comp in test.comparators:
                 if isinstance(comp, ast.Constant) and isinstance(comp.value, bool):
                     self.add(node.lineno, "HIGH",
@@ -360,8 +393,7 @@ class PythonChecker(ast.NodeVisitor):
 
     def _check_empty_if(self, node):
         if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
-            self.add(node.lineno, "MEDIUM",
-                     "`pass` в `if` — пустой блок.")
+            self.add(node.lineno, "MEDIUM", "`pass` в `if` — пусто.")
 
     def visit_Compare(self, node):
         if (isinstance(node.left, ast.Call)
@@ -369,8 +401,7 @@ class PythonChecker(ast.NodeVisitor):
                 and node.left.func.id == "type"):
             for op in node.ops:
                 if isinstance(op, ast.Eq):
-                    self.add(node.lineno, "HIGH",
-                             "`type() ==` — используй `isinstance()`.")
+                    self.add(node.lineno, "HIGH", "`type() ==` — используй `isinstance()`.")
         self.generic_visit(node)
 
     def visit_JoinedStr(self, node):
@@ -383,8 +414,7 @@ class PythonChecker(ast.NodeVisitor):
             self.add(node.lineno, "LOW", "f-string без переменных.")
         self.generic_visit(node)
 
-
-# ============ PYTHON: регулярки ============
+# ============ ПРОВЕРКИ PYTHON (регулярки) ============
 
 def _py_secrets(lines):
     problems = []
@@ -401,11 +431,11 @@ def _py_secrets(lines):
                     value = ""
                 if gidx == 1:
                     problems.append({"line": i, "severity": "CRITICAL",
-                                     "message": f"Хардкод {name} — вынеси в .env"})
+                                     "message": f"Хардкод {name} — .env"})
                     break
                 if not _is_safe_value(value):
                     problems.append({"line": i, "severity": "CRITICAL",
-                                     "message": f"Хардкод {name} — вынеси в .env"})
+                                     "message": f"Хардкод {name} — .env"})
                     break
     return problems
 
@@ -414,7 +444,7 @@ def _py_sql(lines):
     problems = []
     for i, line in enumerate(lines, start=1):
         s = line.strip()
-        if s.startswith("#") or "# noqa" in line or "# nosec" in line:
+        if s.startswith("#") or "# noqa" in line:
             continue
         for pattern, name in PY_SQL_PATTERNS:
             if re.search(pattern, line):
@@ -437,7 +467,7 @@ def _py_paths(lines):
     problems = []
     for i, line in enumerate(lines, start=1):
         s = line.strip()
-        if s.startswith("#") or "# noqa" in line or "# nosec" in line:
+        if s.startswith("#") or "# noqa" in line:
             continue
         for pattern, name in PY_PATH_PATTERNS:
             if re.search(pattern, line):
@@ -580,7 +610,7 @@ def analyze_python(source, filepath):
                  "message": f"Синтаксическая ошибка: {e.msg}"}]
     except RecursionError:
         return [{"line": 1, "severity": "CRITICAL",
-                 "message": "Слишком сложный код (рекурсия)."}]
+                 "message": "Слишком сложный код."}]
 
     checker = PythonChecker()
     checker.visit(tree)
@@ -595,7 +625,7 @@ def analyze_python(source, filepath):
     return _deduplicate(problems)
 
 
-# ============ C++: проверки ============
+# ============ C++ ============
 
 def _cpp_secrets(lines):
     problems = []
@@ -771,6 +801,116 @@ def analyze_cpp(source, filepath):
     return _deduplicate(problems)
 
 
+# ============ HTML ============
+
+def _html_check(source):
+    problems = []
+    for pattern, name, severity, flags in HTML_PATTERNS:
+        for m in re.finditer(pattern, source, flags):
+            line_no = source[:m.start()].count("\n") + 1
+            problems.append({"line": line_no, "severity": severity, "message": name})
+    return problems
+
+
+def _html_secrets(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("<!--") or "<!-- noqa" in line:
+            continue
+        for pattern, name, gidx in SECRET_PATTERNS:
+            m = re.search(pattern, line)
+            if m:
+                try:
+                    value = m.group(gidx) if gidx <= (m.lastindex or 0) else ""
+                except IndexError:
+                    value = ""
+                if gidx == 1:
+                    problems.append({"line": i, "severity": "CRITICAL",
+                                     "message": f"Хардкод {name} — .env"})
+                    break
+                if not _is_safe_value(value):
+                    problems.append({"line": i, "severity": "CRITICAL",
+                                     "message": f"Хардкод {name} — .env"})
+                    break
+    return problems
+
+
+def _html_long_lines(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        if len(line) > MAX_LINE_LENGTH:
+            problems.append({"line": i, "severity": "LOW",
+                             "message": f"Строка длиной {len(line)} (> {MAX_LINE_LENGTH})."})
+    return problems
+
+
+def analyze_html(source, filepath):
+    lines = source.splitlines()
+    problems = []
+
+    problems.extend(_html_check(source))
+    problems.extend(_html_secrets(lines))
+    problems.extend(_html_long_lines(lines))
+
+    return _deduplicate(problems)
+
+
+# ============ JAVASCRIPT ============
+
+def _js_check(source):
+    problems = []
+    for pattern, name, severity in JS_PATTERNS:
+        for m in re.finditer(pattern, source):
+            line_no = source[:m.start()].count("\n") + 1
+            problems.append({"line": line_no, "severity": severity, "message": name})
+    return problems
+
+
+def _js_secrets(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("//") or "// noqa" in line:
+            continue
+        for pattern, name, gidx in SECRET_PATTERNS:
+            m = re.search(pattern, line)
+            if m:
+                try:
+                    value = m.group(gidx) if gidx <= (m.lastindex or 0) else ""
+                except IndexError:
+                    value = ""
+                if gidx == 1:
+                    problems.append({"line": i, "severity": "CRITICAL",
+                                     "message": f"Хардкод {name} — .env"})
+                    break
+                if not _is_safe_value(value):
+                    problems.append({"line": i, "severity": "CRITICAL",
+                                     "message": f"Хардкод {name} — .env"})
+                    break
+    return problems
+
+
+def _js_long_lines(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        if len(line) > MAX_LINE_LENGTH:
+            problems.append({"line": i, "severity": "LOW",
+                             "message": f"Строка длиной {len(line)} (> {MAX_LINE_LENGTH})."})
+    return problems
+
+
+def analyze_js(source, filepath):
+    lines = source.splitlines()
+    problems = []
+
+    problems.extend(_js_check(source))
+    problems.extend(_js_secrets(lines))
+    problems.extend(_js_long_lines(lines))
+
+    return _deduplicate(problems)
+
+
 # ============ ГЛАВНАЯ ============
 
 def analyze(filepath):
@@ -794,9 +934,13 @@ def analyze(filepath):
         return analyze_python(source, filepath)
     elif lang == "cpp":
         return analyze_cpp(source, filepath)
+    elif lang == "html":
+        return analyze_html(source, filepath)
+    elif lang == "js":
+        return analyze_js(source, filepath)
     else:
         return [{"line": 1, "severity": "INFO",
-                 "message": "Поддерживаются: Python, C++"}]
+                 "message": "Поддерживаются: Python, C++, HTML, JavaScript"}]
 
 
 def print_report(filepath, problems):
