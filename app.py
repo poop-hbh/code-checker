@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Веб-версия Code Checker. Python + C++.
+Веб-версия Code Checker. Python + C++ + HTML + JavaScript.
 Запуск: python app.py
 Открыть: http://127.0.0.1:8000
 """
@@ -54,7 +54,7 @@ HTML_PAGE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Code Checker — Python + C++</title>
+    <title>Code Checker — Python + C++ + HTML + JS</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -78,6 +78,7 @@ HTML_PAGE = """
             display: flex;
             justify-content: center;
             gap: 8px;
+            flex-wrap: wrap;
         }
         .lang-switch button {
             padding: 6px 14px;
@@ -201,10 +202,12 @@ HTML_PAGE = """
 <body>
     <header>
         <h1>🔍 Code Checker</h1>
-        <p>60+ проверок: Python + C++ — хардкод, SQL, eval/exec, голые except и другие</p>
+        <p>60+ проверок: Python + C++ + HTML + JavaScript</p>
         <div class="lang-switch">
             <button id="lang-py" class="active" onclick="setLang('py')">Python</button>
             <button id="lang-cpp" onclick="setLang('cpp')">C++</button>
+            <button id="lang-html" onclick="setLang('html')">HTML</button>
+            <button id="lang-js" onclick="setLang('js')">JavaScript</button>
         </div>
     </header>
 
@@ -228,38 +231,60 @@ HTML_PAGE = """
         const checkBtn = document.getElementById('check');
         const resultEl = document.getElementById('result');
         const inputTitle = document.getElementById('input-title');
-        const langPy = document.getElementById('lang-py');
-        const langCpp = document.getElementById('lang-cpp');
+        const btnPy = document.getElementById('lang-py');
+        const btnCpp = document.getElementById('lang-cpp');
+        const btnHtml = document.getElementById('lang-html');
+        const btnJs = document.getElementById('lang-js');
 
         let currentLang = 'py';
         let currentFilename = 'code.py';
 
         function setLang(lang) {
             currentLang = lang;
+            btnPy.classList.remove('active');
+            btnCpp.classList.remove('active');
+            btnHtml.classList.remove('active');
+            btnJs.classList.remove('active');
+
             if (lang === 'py') {
                 currentFilename = 'code.py';
                 inputTitle.textContent = 'Вставь Python-код:';
                 codeEl.placeholder = 'Вставь Python-код сюда...';
-                langPy.classList.add('active');
-                langCpp.classList.remove('active');
-            } else {
+                btnPy.classList.add('active');
+            } else if (lang === 'cpp') {
                 currentFilename = 'code.cpp';
                 inputTitle.textContent = 'Вставь C++-код:';
                 codeEl.placeholder = 'Вставь C++-код сюда...';
-                langCpp.classList.add('active');
-                langPy.classList.remove('active');
+                btnCpp.classList.add('active');
+            } else if (lang === 'html') {
+                currentFilename = 'code.html';
+                inputTitle.textContent = 'Вставь HTML-код:';
+                codeEl.placeholder = 'Вставь HTML-код сюда...';
+                btnHtml.classList.add('active');
+            } else if (lang === 'js') {
+                currentFilename = 'code.js';
+                inputTitle.textContent = 'Вставь JavaScript-код:';
+                codeEl.placeholder = 'Вставь JavaScript-код сюда...';
+                btnJs.classList.add('active');
             }
         }
 
         function detectLang(text) {
-            const head = text.substring(0, 500);
+            const head = text.substring(0, 500).toLowerCase();
             if (head.includes('#include') || head.includes('std::') ||
-                head.includes('using namespace') || head.includes('cout <<') ||
-                head.includes('cin >>')) {
+                head.includes('using namespace') || head.includes('cout <<')) {
                 return 'cpp';
             }
+            if (head.includes('<!doctype html') || head.includes('<html') ||
+                head.includes('<body') || head.includes('<div')) {
+                return 'html';
+            }
+            if (head.includes('function ') || head.includes('const ') ||
+                head.includes('let ') || head.includes('document.')) {
+                return 'js';
+            }
             if (head.includes('def ') || head.includes('import ') ||
-                head.includes('print(') || head.includes('class ') && head.includes(':')) {
+                head.includes('print(')) {
                 return 'py';
             }
             return null;
@@ -308,11 +333,11 @@ HTML_PAGE = """
                 if (data.error) {
                     if (data.error.includes('Синтаксическая ошибка') && currentLang === 'py') {
                         const detected = detectLang(code);
-                        if (detected === 'cpp') {
-                            setLang('cpp');
+                        if (detected && detected !== 'py') {
+                            setLang(detected);
                             resultEl.innerHTML =
-                                '<div class="hint">Похоже, это C++-код. Я переключил язык на C++. ' +
-                                'Проверьте ещё раз.</div>';
+                                '<div class="hint">Похоже, это ' + detected.toUpperCase() +
+                                '-код. Я переключил язык. Проверьте ещё раз.</div>';
                             checkBtn.disabled = false;
                             return;
                         }
@@ -365,42 +390,36 @@ HTML_PAGE = """
 """
 
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_PAGE
+# ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+
+def _validate_python(code: str):
+    """Проверяет синтаксис Python. Возвращает None, если всё ок."""
+    try:
+        ast.parse(code)
+        return None
+    except SyntaxError as e:
+        return f"Синтаксическая ошибка: строка {e.lineno}, {e.msg}"
+    except RecursionError:
+        return "Слишком сложный код."
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok"}
+def _get_suffix(filename: str) -> str:
+    """Определяет расширение файла по имени."""
+    suffix_map = {
+        ".py": ".py",
+        ".cpp": ".cpp", ".cc": ".cpp", ".cxx": ".cpp",
+        ".c": ".cpp", ".h": ".cpp", ".hpp": ".cpp",
+        ".html": ".html", ".htm": ".html",
+        ".js": ".js", ".mjs": ".js",
+    }
+    for key, val in suffix_map.items():
+        if filename.endswith(key):
+            return val
+    return ".py"
 
 
-@app.post("/check")
-async def check_code(payload: CodeRequest, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
-    if not check_rate(client_ip):
-        raise HTTPException(status_code=429, detail="Too many requests")
-
-    code = payload.code
-    if not code.strip():
-        return {"problems": [], "error": "Пустой код"}
-
-    filename = payload.filename or "code.py"
-    if filename.endswith(".py"):
-        try:
-            ast.parse(code)
-        except SyntaxError as e:
-            return {
-                "problems": [],
-                "error": f"Синтаксическая ошибка: строка {e.lineno}, {e.msg}"
-            }
-        except RecursionError:
-            return {
-                "problems": [],
-                "error": "Слишком сложный код (глубокая рекурсия)."
-            }
-
-    suffix = ".cpp" if filename.endswith((".cpp", ".cc", ".cxx", ".c", ".h", ".hpp")) else ".py"
+async def _save_and_analyze(code: str, suffix: str):
+    """Сохраняет код в tmp-файл и анализирует."""
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -426,6 +445,40 @@ async def check_code(payload: CodeRequest, request: Request):
             except OSError as e:
                 print(f"[WARN] Не удалось удалить временный файл: {e}")
 
+
+# ============ ЭНДПОИНТЫ ============
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML_PAGE
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
+@app.post("/check")
+async def check_code(payload: CodeRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    code = payload.code
+    if not code.strip():
+        return {"problems": [], "error": "Пустой код"}
+
+    filename = payload.filename or "code.py"
+    if filename.endswith(".py"):
+        error = _validate_python(code)
+        if error:
+            return {"problems": [], "error": error}
+
+    suffix = _get_suffix(filename)
+    return await _save_and_analyze(code, suffix)
+
+
+# ============ ЗАПУСК ============
 
 if __name__ == "__main__":
     uvicorn.run(app, host="127.0.0.1", port=8000)
