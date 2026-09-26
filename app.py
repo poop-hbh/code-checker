@@ -5,11 +5,13 @@
 Открыть: http://127.0.0.1:8000
 """
 
-import ast
+import asyncio
 import os
+import logging
 import tempfile
 import uvicorn
 
+from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -18,6 +20,13 @@ from collections import defaultdict
 from time import time
 
 from checker import analyze
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - [%(levelname)s] - %(message)s",
+)
+logger = logging.getLogger("CodeCheckerWeb")
 
 
 app = FastAPI(title="Code Checker")
@@ -31,7 +40,21 @@ app.add_middleware(
 
 RATE_LIMIT = 20
 RATE_WINDOW = 60
+RATE_CLEANUP_EVERY = 100
+
 _rate_store = defaultdict(list)
+_rate_counter = [0]
+
+SELF_CHECK_FILES = ("app.py", "checker.py")
+BASE_DIR = Path(__file__).resolve().parent
+
+
+def _cleanup_rate_store():
+    now = time()
+    dead = [ip for ip, times in _rate_store.items()
+            if not times or now - times[-1] > RATE_WINDOW]
+    for ip in dead:
+        del _rate_store[ip]
 
 
 def check_rate(ip: str) -> bool:
@@ -40,11 +63,17 @@ def check_rate(ip: str) -> bool:
     if len(_rate_store[ip]) >= RATE_LIMIT:
         return False
     _rate_store[ip].append(now)
+
+    _rate_counter[0] += 1
+    if _rate_counter[0] >= RATE_CLEANUP_EVERY:
+        _rate_counter[0] = 0
+        _cleanup_rate_store()
+
     return True
 
 
 class CodeRequest(BaseModel):
-    code: str = Field(..., min_length=1, max_length=50000)
+    code: str = Field(..., min_length=1, max_length=20000)
     filename: str = Field(default="code.py", max_length=200)
 
 
@@ -96,6 +125,18 @@ HTML_PAGE = """
             color: #fff;
             border-color: #3a6b9a;
         }
+        .lang-switch button.self-check {
+            background: #1a3a2a;
+            color: #7fe0a0;
+            border-color: #2a5a3a;
+        }
+        .lang-switch button.self-check:hover {
+            background: #2a5a3a;
+        }
+        .lang-switch button.self-check:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
         main {
             flex: 1;
             max-width: 1100px;
@@ -119,6 +160,37 @@ HTML_PAGE = """
             font-size: 16px;
             margin-bottom: 12px;
             color: #ccc;
+        }
+        .result-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .result-header h2 {
+            margin-bottom: 0;
+        }
+        .copy-btn {
+            padding: 6px 12px;
+            background: #1f2a1f;
+            color: #7fe0a0;
+            border: 1px solid #2a5a3a;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 600;
+            transition: background 0.2s;
+        }
+        .copy-btn:hover {
+            background: #2a5a3a;
+        }
+        .copy-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .copy-btn.copied {
+            background: #2a5a3a;
+            color: #fff;
         }
         textarea {
             flex: 1;
@@ -165,6 +237,7 @@ HTML_PAGE = """
         .problem.high { background: #2a2a1a; border-left-color: #f1c40f; }
         .problem.medium { background: #2a201a; border-left-color: #e67e22; }
         .problem.low { background: #1a1a1a; border-left-color: #95a5a6; }
+        .problem.info { background: #1a2a3a; border-left-color: #3498db; }
         .problem .line { color: #888; font-size: 11px; margin-bottom: 4px; }
         .problem .msg { color: #eee; }
         .ok {
@@ -190,13 +263,24 @@ HTML_PAGE = """
         }
         .hint {
             padding: 12px;
-            background: #2a2a1a;
-            border-left: 3px solid #f1c40f;
+            background: #1a2a3a;
+            border-left: 3px solid #3498db;
             border-radius: 6px;
-            color: #f1c40f;
-            font-size: 13px;
+            color: #7fb3d5;
+            font-size: 14px;
             margin-bottom: 12px;
         }
+        .file-header {
+            padding: 10px 14px;
+            background: #2a3a2a;
+            border-radius: 6px;
+            color: #7fe0a0;
+            font-weight: 600;
+            font-size: 14px;
+            margin: 16px 0 10px 0;
+        }
+        .file-header:first-child { margin-top: 0; }
+        .file-block { margin-bottom: 20px; }
     </style>
 </head>
 <body>
@@ -208,18 +292,22 @@ HTML_PAGE = """
             <button id="lang-cpp" onclick="setLang('cpp')">C++</button>
             <button id="lang-html" onclick="setLang('html')">HTML</button>
             <button id="lang-js" onclick="setLang('js')">JavaScript</button>
+            <button id="self-check" class="self-check" onclick="checkSelf()">🪞 Проверить себя</button>
         </div>
     </header>
 
     <main>
         <div class="panel">
             <h2 id="input-title">Вставь Python-код:</h2>
-            <textarea id="code" placeholder="Вставь код сюда..." maxlength="50000"></textarea>
+            <textarea id="code" placeholder="Вставь код сюда..." maxlength="20000"></textarea>
             <button class="check-btn" id="check">Проверить</button>
         </div>
 
         <div class="panel">
-            <h2>Результат:</h2>
+            <div class="result-header">
+                <h2>Результат:</h2>
+                <button class="copy-btn" id="copy" onclick="copyReport()" disabled>📋 Копировать</button>
+            </div>
             <div id="result">
                 <div class="ok">Здесь появится отчёт</div>
             </div>
@@ -229,15 +317,20 @@ HTML_PAGE = """
     <script>
         const codeEl = document.getElementById('code');
         const checkBtn = document.getElementById('check');
+        const copyBtn = document.getElementById('copy');
         const resultEl = document.getElementById('result');
         const inputTitle = document.getElementById('input-title');
         const btnPy = document.getElementById('lang-py');
         const btnCpp = document.getElementById('lang-cpp');
         const btnHtml = document.getElementById('lang-html');
         const btnJs = document.getElementById('lang-js');
+        const btnSelf = document.getElementById('self-check');
 
         let currentLang = 'py';
         let currentFilename = 'code.py';
+
+        let lastProblems = [];
+        let lastSourceName = '';
 
         function setLang(lang) {
             currentLang = lang;
@@ -269,20 +362,36 @@ HTML_PAGE = """
             }
         }
 
+        // ФИКС v12.0: если код начинается с "<" — это HTML (фрагмент без <html>)
         function detectLang(text) {
-            const head = text.substring(0, 500).toLowerCase();
+            const trimmed = text.trimStart();
+            const head = text.substring(0, 2000).toLowerCase();
+
+            // 1. C++
             if (head.includes('#include') || head.includes('std::') ||
                 head.includes('using namespace') || head.includes('cout <<')) {
                 return 'cpp';
             }
-            if (head.includes('<!doctype html') || head.includes('<html') ||
-                head.includes('<body') || head.includes('<div')) {
+
+            // 2. HTML — если код начинается с "<"
+            if (trimmed.startsWith('<')) {
                 return 'html';
             }
-            if (head.includes('function ') || head.includes('const ') ||
-                head.includes('let ') || head.includes('document.')) {
+
+            // 3. HTML — по тегам в начале
+            if (head.includes('<!doctype html') || head.includes('<html') ||
+                head.includes('<head') || head.includes('<body')) {
+                return 'html';
+            }
+
+            // 4. JS
+            if (head.includes('function ') || head.includes('var ') ||
+                head.includes('console.log') || head.includes('document.') ||
+                head.includes('=>')) {
                 return 'js';
             }
+
+            // 5. Python
             if (head.includes('def ') || head.includes('import ') ||
                 head.includes('print(')) {
                 return 'py';
@@ -290,23 +399,101 @@ HTML_PAGE = """
             return null;
         }
 
-        codeEl.addEventListener('input', function() {
-            const text = codeEl.value;
-            const detected = detectLang(text);
-            if (detected && detected !== currentLang) {
-                setLang(detected);
-            }
+        let debounceTimer = null;
+        function handleInputDebounced() {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(function() {
+                const text = codeEl.value;
+                const detected = detectLang(text);
+                if (detected && detected !== currentLang) {
+                    setLang(detected);
+                }
+            }, 300);
+        }
+
+        codeEl.addEventListener('input', handleInputDebounced);
+        codeEl.addEventListener('paste', function() {
+            setTimeout(handleInputDebounced, 50);
         });
+
+        const LANG_NAMES = {
+            'py': 'Python',
+            'cpp': 'C++',
+            'html': 'HTML',
+            'js': 'JavaScript'
+        };
+
+        function renderProblems(data, container, sourceName) {
+            if (data.error) {
+                container.innerHTML = '<div class="error">' + escapeHtml(data.error) + '</div>';
+                copyBtn.disabled = true;
+                return;
+            }
+
+            if (!data.problems || data.problems.length === 0) {
+                container.innerHTML = '<div class="ok">✅ Критичных проблем не найдено. Молодец!</div>';
+                copyBtn.disabled = true;
+                return;
+            }
+
+            const onlyInfo = data.problems.every(function(p) {
+                return p.severity === 'INFO';
+            });
+
+            if (onlyInfo) {
+                let html = '';
+                for (const p of data.problems) {
+                    html += '<div class="hint">ℹ️ ' + escapeHtml(p.message) + '</div>';
+                }
+                container.innerHTML = html;
+                copyBtn.disabled = true;
+                return;
+            }
+
+            lastProblems = data.problems;
+            lastSourceName = sourceName || 'code';
+            copyBtn.disabled = false;
+
+            let html = '<div class="summary">Найдено проблем: ' + data.problems.length + '</div>';
+            for (const p of data.problems) {
+                let cls = 'problem';
+                if (p.severity === 'CRITICAL') cls = 'problem';
+                else if (p.severity === 'HIGH') cls = 'problem high';
+                else if (p.severity === 'MEDIUM') cls = 'problem medium';
+                else if (p.severity === 'LOW') cls = 'problem low';
+                else if (p.severity === 'INFO') cls = 'problem info';
+
+                let marker = '🔴';
+                if (p.severity === 'CRITICAL') marker = '🔴';
+                else if (p.severity === 'HIGH') marker = '🟡';
+                else if (p.severity === 'MEDIUM') marker = '🟠';
+                else if (p.severity === 'LOW') marker = '⚪';
+                else if (p.severity === 'INFO') marker = 'ℹ️';
+
+                html += '<div class="' + cls + '">';
+                html += '<div class="line">' + marker + ' Строка ' + p.line + '</div>';
+                html += '<div class="msg">' + escapeHtml(p.message) + '</div>';
+                html += '</div>';
+            }
+            container.innerHTML = html;
+        }
 
         async function checkCode() {
             const code = codeEl.value.trim();
             if (!code) {
                 resultEl.innerHTML = '<div class="error">Вставь код для проверки.</div>';
+                copyBtn.disabled = true;
                 return;
+            }
+
+            const detected = detectLang(code);
+            if (detected && detected !== currentLang) {
+                setLang(detected);
             }
 
             checkBtn.disabled = true;
             resultEl.innerHTML = '<div class="ok">Анализирую...</div>';
+            copyBtn.disabled = true;
 
             try {
                 const res = await fetch('/check', {
@@ -329,51 +516,147 @@ HTML_PAGE = """
                 }
 
                 const data = await res.json();
+                renderProblems(data, resultEl, LANG_NAMES[currentLang] || 'код');
 
-                if (data.error) {
-                    if (data.error.includes('Синтаксическая ошибка') && currentLang === 'py') {
-                        const detected = detectLang(code);
-                        if (detected && detected !== 'py') {
-                            setLang(detected);
-                            resultEl.innerHTML =
-                                '<div class="hint">Похоже, это ' + detected.toUpperCase() +
-                                '-код. Я переключил язык. Проверьте ещё раз.</div>';
-                            checkBtn.disabled = false;
-                            return;
-                        }
-                    }
-                    resultEl.innerHTML = '<div class="error">' + escapeHtml(data.error) + '</div>';
+            } catch (e) {
+                resultEl.innerHTML = '<div class="error">Ошибка: ' + escapeHtml(e.message) + '</div>';
+                copyBtn.disabled = true;
+            } finally {
+                checkBtn.disabled = false;
+            }
+        }
+
+        async function checkSelf() {
+            btnSelf.disabled = true;
+            resultEl.innerHTML = '<div class="ok">🔍 Проверяю свои файлы...</div>';
+            copyBtn.disabled = true;
+
+            try {
+                const res = await fetch('/check-self', {method: 'GET'});
+
+                if (res.status === 429) {
+                    resultEl.innerHTML = '<div class="error">Слишком много запросов. Подожди минуту.</div>';
+                    return;
+                }
+                if (!res.ok) {
+                    resultEl.innerHTML = '<div class="error">Ошибка сервера: ' + res.status + '</div>';
                     return;
                 }
 
-                if (data.problems.length === 0) {
-                    resultEl.innerHTML = '<div class="ok">✅ Критичных проблем не найдено. Молодец!</div>';
+                const data = await res.json();
+
+                if (!data.results) {
+                    resultEl.innerHTML = '<div class="error">Сервер вернул неверный ответ.</div>';
                     return;
                 }
 
-                let html = '<div class="summary">Найдено проблем: ' + data.problems.length + '</div>';
-                for (const p of data.problems) {
-                    let cls = 'problem';
-                    if (p.severity === 'HIGH') cls = 'problem high';
-                    else if (p.severity === 'MEDIUM') cls = 'problem medium';
-                    else if (p.severity === 'LOW') cls = 'problem low';
+                let allProblems = [];
+                let html = '';
+                for (const item of data.results) {
+                    html += '<div class="file-header">📄 ' + escapeHtml(item.file) +
+                            ' (' + item.problems.length + ' проблем)</div>';
+                    html += '<div class="file-block">';
 
-                    let marker = '🔴';
-                    if (p.severity === 'HIGH') marker = '🟡';
-                    else if (p.severity === 'MEDIUM') marker = '🟠';
-                    else if (p.severity === 'LOW') marker = '⚪';
+                    const tmp = document.createElement('div');
+                    renderProblems({problems: item.problems, error: null}, tmp, item.file);
+                    html += tmp.innerHTML;
 
-                    html += '<div class="' + cls + '">';
-                    html += '<div class="line">' + marker + ' Строка ' + p.line + '</div>';
-                    html += '<div class="msg">' + escapeHtml(p.message) + '</div>';
                     html += '</div>';
+
+                    for (const p of item.problems) {
+                        allProblems.push({
+                            line: p.line,
+                            severity: p.severity,
+                            message: '[' + item.file + '] ' + p.message
+                        });
+                    }
                 }
+
                 resultEl.innerHTML = html;
+
+                if (allProblems.length > 0) {
+                    lastProblems = allProblems;
+                    lastSourceName = 'self-check (app.py + checker.py)';
+                    copyBtn.disabled = false;
+                }
 
             } catch (e) {
                 resultEl.innerHTML = '<div class="error">Ошибка: ' + escapeHtml(e.message) + '</div>';
             } finally {
-                checkBtn.disabled = false;
+                btnSelf.disabled = false;
+            }
+        }
+
+        async function copyReport() {
+            if (!lastProblems || lastProblems.length === 0) {
+                return;
+            }
+
+            const MARKERS = {
+                'CRITICAL': '🔴',
+                'HIGH': '🟡',
+                'MEDIUM': '🟠',
+                'LOW': '⚪',
+                'INFO': 'ℹ️',
+            };
+
+            let text = '';
+            text += 'Code Checker — отчёт\\n';
+            text += 'Файл: ' + lastSourceName + '\\n';
+            text += 'Найдено проблем: ' + lastProblems.length + '\\n';
+            text += '\\n';
+
+            for (const p of lastProblems) {
+                const marker = MARKERS[p.severity] || '•';
+                text += marker + ' Строка ' + p.line + ': ' + p.message + '\\n';
+            }
+
+            function showCopied() {
+                copyBtn.textContent = '✅ Скопировано!';
+                copyBtn.classList.add('copied');
+                setTimeout(function() {
+                    copyBtn.textContent = '📋 Копировать';
+                    copyBtn.classList.remove('copied');
+                }, 2000);
+            }
+
+            function showError() {
+                copyBtn.textContent = '❌ Не удалось';
+                setTimeout(function() {
+                    copyBtn.textContent = '📋 Копировать';
+                }, 2000);
+            }
+
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                try {
+                    await navigator.clipboard.writeText(text);
+                    showCopied();
+                    return;
+                } catch (e) {
+                    // падаем в fallback
+                }
+            }
+
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+
+            let ok = false;
+            try {
+                ok = document.execCommand('copy');
+            } catch (err) {
+                ok = false;
+            }
+
+            document.body.removeChild(ta);
+
+            if (ok) {
+                showCopied();
+            } else {
+                showError();
             }
         }
 
@@ -392,34 +675,55 @@ HTML_PAGE = """
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
-def _validate_python(code: str):
-    """Проверяет синтаксис Python. Возвращает None, если всё ок."""
-    try:
-        ast.parse(code)
-        return None
-    except SyntaxError as e:
-        return f"Синтаксическая ошибка: строка {e.lineno}, {e.msg}"
-    except RecursionError:
-        return "Слишком сложный код."
+def _detect_language_from_code(code: str, filename: str = "code.py") -> str:
+    """
+    ФИКС v12.0: если код начинается с "<" — это HTML.
+    Приоритет: явное расширение -> начинается с "<" (HTML) -> эвристика.
+    """
+    ext = Path(filename).suffix.lower()
+
+    if ext in (".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"):
+        return "cpp"
+    if ext == ".py":
+        return "python"
+    if ext in (".html", ".htm"):
+        return "html"
+    if ext in (".js", ".mjs"):
+        return "js"
+
+    head = code[:2000].lower()
+    trimmed = code.lstrip()
+
+    if "#include" in head or "std::" in head or "using namespace" in head:
+        return "cpp"
+
+    # ФИКС: HTML-фрагмент начинается с "<"
+    if trimmed.startswith("<"):
+        return "html"
+
+    if ("<!doctype html" in head or "<html" in head or
+            "<head" in head or "<body" in head):
+        return "html"
+
+    if ("function " in head or "var " in head or
+            "console.log" in head or "document." in head or
+            "=>" in head):
+        return "js"
+
+    return "python"
 
 
-def _get_suffix(filename: str) -> str:
-    """Определяет расширение файла по имени."""
+def _get_suffix(lang: str) -> str:
     suffix_map = {
-        ".py": ".py",
-        ".cpp": ".cpp", ".cc": ".cpp", ".cxx": ".cpp",
-        ".c": ".cpp", ".h": ".cpp", ".hpp": ".cpp",
-        ".html": ".html", ".htm": ".html",
-        ".js": ".js", ".mjs": ".js",
+        "python": ".py",
+        "cpp": ".cpp",
+        "html": ".html",
+        "js": ".js",
     }
-    for key, val in suffix_map.items():
-        if filename.endswith(key):
-            return val
-    return ".py"
+    return suffix_map.get(lang, ".py")
 
 
 async def _save_and_analyze(code: str, suffix: str):
-    """Сохраняет код в tmp-файл и анализирует."""
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -431,11 +735,11 @@ async def _save_and_analyze(code: str, suffix: str):
         if tmp_path is None:
             return {"problems": [], "error": "Не удалось создать временный файл"}
 
-        problems = analyze(tmp_path)
+        problems = await asyncio.to_thread(analyze, tmp_path)
         return {"problems": problems, "error": None}
 
     except Exception as e:
-        print(f"[ERROR] analyze failed: {e}")
+        logger.error(f"analyze failed: {e}")
         return {"problems": [], "error": f"Ошибка анализа: {str(e)}"}
 
     finally:
@@ -443,7 +747,7 @@ async def _save_and_analyze(code: str, suffix: str):
             try:
                 os.unlink(tmp_path)
             except OSError as e:
-                print(f"[WARN] Не удалось удалить временный файл: {e}")
+                logger.warning(f"Не удалось удалить временный файл: {e}")
 
 
 # ============ ЭНДПОИНТЫ ============
@@ -468,14 +772,42 @@ async def check_code(payload: CodeRequest, request: Request):
     if not code.strip():
         return {"problems": [], "error": "Пустой код"}
 
-    filename = payload.filename or "code.py"
-    if filename.endswith(".py"):
-        error = _validate_python(code)
-        if error:
-            return {"problems": [], "error": error}
+    real_lang = _detect_language_from_code(code, payload.filename)
+    logger.info(f"Detected language: {real_lang} (filename={payload.filename})")
 
-    suffix = _get_suffix(filename)
+    suffix = _get_suffix(real_lang)
     return await _save_and_analyze(code, suffix)
+
+
+@app.get("/check-self")
+async def check_self(request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+
+    results = []
+    for filename in SELF_CHECK_FILES:
+        filepath = BASE_DIR / filename
+        if not filepath.exists():
+            results.append({
+                "file": filename,
+                "problems": [{"line": 1, "severity": "INFO",
+                              "message": f"Файл не найден: {filename}"}],
+            })
+            continue
+
+        try:
+            problems = await asyncio.to_thread(analyze, str(filepath))
+            results.append({"file": filename, "problems": problems})
+        except Exception as e:
+            logger.error(f"check-self failed for {filename}: {e}")
+            results.append({
+                "file": filename,
+                "problems": [{"line": 1, "severity": "CRITICAL",
+                              "message": f"Ошибка анализа: {str(e)}"}],
+            })
+
+    return {"results": results}
 
 
 # ============ ЗАПУСК ============
