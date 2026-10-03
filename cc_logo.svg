@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 200" width="100%" height="100%">
+  <defs>
+    <!-- Фон -->
+    <radialGradient id="bg" cx="50%" cy="45%" r="70%">
+      <stop offset="0%" stop-color="#1a2a3a"/>
+      <stop offset="100%" stop-color="#0a0f14"/>
+    </radialGradient>
+
+    <!-- Неоновый градиент -->
+    <linearGradient id="neon" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7fe0a0"/>
+      <stop offset="100%" stop-color="#2b5278"/>
+    </linearGradient>
+
+    <!-- Градиент для стекла -->
+    <radialGradient id="glass" cx="40%" cy="35%" r="70%">
+      <stop offset="0%" stop-color="#0d1a24" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#05080c" stop-opacity="0.95"/>
+    </radialGradient>
+
+    <!-- Свечение -->
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Сильное свечение для глаза/блика -->
+    <filter id="glowStrong" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Фон -->
+  <rect width="200" height="200" rx="28" fill="url(#bg)"/>
+
+  <!-- РУЧКА ЛУПЫ (уходит вниз-вправо) -->
+  <g filter="url(#glow)">
+    <!-- Обводка ручки -->
+    <line x1="128" y1="128" x2="168" y2="172"
+          stroke="url(#neon)" stroke-width="14" stroke-linecap="round"/>
+    <!-- Внутренняя тёмная часть ручки -->
+    <line x1="128" y1="128" x2="168" y2="172"
+          stroke="#0a0f14" stroke-width="6" stroke-linecap="round"/>
+    <!-- Блик на ручке -->
+    <line x1="132" y1="130" x2="162" y2="166"
+          stroke="#7fe0a0" stroke-width="1.5" stroke-linecap="round" opacity="0.5"/>
+  </g>
+
+  <!-- ОПРАВА ЛУПЫ (внешнее кольцо) -->
+  <g filter="url(#glow)">
+    <circle cx="95" cy="90" r="58" fill="#0a0f14"
+            stroke="url(#neon)" stroke-width="7"/>
+    <!-- Внутренняя тонкая обводка -->
+    <circle cx="95" cy="90" r="52" fill="none"
+            stroke="#7fe0a0" stroke-width="1" opacity="0.4"/>
+  </g>
+
+  <!-- СТЕКЛО ЛУПЫ (внутренняя область) -->
+  <circle cx="95" cy="90" r="52" fill="url(#glass)"/>
+
+  <!-- СЛОМАННЫЙ КОД ВНУТРИ ЛУПЫ -->
+  <g font-family="Consolas, Monaco, monospace" font-weight="700" font-size="11" fill="#7fe0a0" opacity="0.9">
+    <!-- Первая строка -->
+    <text x="58" y="70">if (x =</text>
+    <!-- Вторая строка со смещением -->
+    <text x="68" y="85">5) {</text>
+    <!-- Третья строка -->
+    <text x="58" y="100">return</text>
+    <!-- Четвёртая строка -->
+    <text x="68" y="115">foo }</text>
+  </g>
+
+  <!-- ТРЕЩИНА через стекло (главная фишка) -->
+  <g filter="url(#glowStrong)">
+    <!-- Тень трещины -->
+    <path d="M 55 60 L 80 78 L 72 92 L 100 100 L 95 118 L 120 130"
+          fill="none" stroke="#7fe0a0" stroke-width="3"
+          stroke-linejoin="round" stroke-linecap="round" opacity="0.9"/>
+    <!-- Ответвление 1 -->
+    <path d="M 80 78 L 92 70"
+          fill="none" stroke="#7fe0a0" stroke-width="2"
+          stroke-linejoin="round" stroke-linecap="round" opacity="0.7"/>
+    <!-- Ответвление 2 -->
+    <path d="M 100 100 L 115 95"
+          fill="none" stroke="#7fe0a0" stroke-width="2"
+          stroke-linejoin="round" stroke-linecap="round" opacity="0.7"/>
+    <!-- Ответвление 3 -->
+    <path d="M 72 92 L 62 100"
+          fill="none" stroke="#7fe0a0" stroke-width="2"
+          stroke-linejoin="round" stroke-linecap="round" opacity="0.7"/>
+  </g>
+
+  <!-- КРАСНЫЙ МАРКЕР ОШИБКИ (точка в правом верхнем углу стекла) -->
+  <g filter="url(#glowStrong)">
+    <circle cx="135" cy="55" r="8" fill="#ff3b3b"/>
+    <circle cx="135" cy="55" r="3" fill="#ffffff"/>
+  </g>
+
+  <!-- БЛИК НА СТЕКЛЕ (эффект отражения) -->
+  <ellipse cx="72" cy="65" rx="18" ry="10" fill="#ffffff" opacity="0.06"
+           transform="rotate(-30 72 65)"/>
+  <ellipse cx="70" cy="62" rx="8" ry="4" fill="#ffffff" opacity="0.1"
+           transform="rotate(-30 70 62)"/>
+
+  <!-- Мелкие частички «сломанного кода» (плавающие символы) -->
+  <g font-family="Consolas, Monaco, monospace" font-weight="900" font-size="8" fill="#7fe0a0" opacity="0.5">
+    <text x="42" y="130">{</text>
+    <text x="145" y="105">;</text>
+    <text x="55" y="50">&lt;</text>
+    <text x="150" y="75">)</text>
+  </g>
+</svg>
