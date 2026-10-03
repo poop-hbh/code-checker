@@ -1,8 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Веб-версия Code Checker v16.10. Python + C++ + HTML + JavaScript + Go.
+Веб-версия Code Checker v16.15. Python + C++ + HTML + JavaScript + Go.
 Запуск: python app.py
 Открыть: http://127.0.0.1:8000
+
+Изменения:
+  - XSS-фикс (data-* вместо inline onclick)
+  - ZIP: защита от zip-бомб
+  - CORS: whitelist
+  - _zip_collect_files разбит на две функции
+  - Favicon из static/favicon.svg
 """
 
 import asyncio
@@ -11,11 +18,13 @@ import io
 import zipfile
 import logging
 import tempfile
+import fnmatch
 import uvicorn
 
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles  # ← ДОБАВЛЕНО
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from collections import defaultdict
@@ -33,12 +42,21 @@ logger = logging.getLogger("CodeCheckerWeb")
 
 app = FastAPI(title="Code Checker")
 
-from fastapi.staticfiles import StaticFiles
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# ← ДОБАВЛЕНО: монтирование папки static (для favicon и других файлов)
+STATIC_DIR = Path(__file__).resolve().parent / "static"
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+else:
+    logger.warning("Папка static/ не найдена — favicon работать не будет")
+
+ALLOWED_ORIGINS = [
+    "http://127.0.0.1:8000",
+    "http://localhost:8000",
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
@@ -52,6 +70,10 @@ _rate_counter = [0]
 
 SELF_CHECK_FILES = ("app.py", "checker.py")
 BASE_DIR = Path(__file__).resolve().parent
+CHECKERIGNORE_FILE = BASE_DIR / ".checkerignore"
+
+TMP_DIR = BASE_DIR / "tmp"
+TMP_DIR.mkdir(exist_ok=True)
 
 
 def _cleanup_rate_store():
@@ -82,12 +104,17 @@ class CodeRequest(BaseModel):
     filename: str = Field(default="code.py", max_length=200)
 
 
+class CheckerignoreRequest(BaseModel):
+    content: str = Field(..., max_length=10000)
+
+
 HTML_PAGE = """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">  <!-- ← ДОБАВЛЕНО -->
     <title>Code Checker — Python + C++ + HTML + JS + Go</title>
     <style>
         :root {
@@ -175,11 +202,7 @@ HTML_PAGE = """
         .disclaimer b { color: #66ccff; }
         .disclaimer ul { margin: 6px 0 10px 20px; }
         .disclaimer li { margin-bottom: 3px; }
-        .disclaimer .warn {
-            color: #e67e22;
-            font-weight: 600;
-            margin-top: 10px;
-        }
+        .disclaimer .warn { color: #e67e22; font-weight: 600; margin-top: 10px; }
         .disclaimer code {
             background: #0f1a26;
             color: #a0d0ff;
@@ -207,11 +230,7 @@ HTML_PAGE = """
             flex-direction: column;
             position: relative;
         }
-        .panel h2 {
-            font-size: 16px;
-            margin-bottom: 12px;
-            color: var(--text-mid);
-        }
+        .panel h2 { font-size: 16px; margin-bottom: 12px; color: var(--text-mid); }
         .result-header {
             display: flex;
             justify-content: space-between;
@@ -240,10 +259,7 @@ HTML_PAGE = """
         .download-btn:hover { background: #2a3a5a; }
         .json-btn { background: #2a1f3a; color: #d0a0ff; border-color: #4a2a5a; }
         .json-btn:hover { background: #4a2a5a; }
-        .drop-zone {
-            position: relative;
-            margin-bottom: 12px;
-        }
+        .drop-zone { position: relative; margin-bottom: 12px; }
         .drop-zone.dragover textarea {
             border-color: var(--accent-hover);
             background: rgba(58, 107, 154, 0.1);
@@ -297,18 +313,8 @@ HTML_PAGE = """
         .code-info .limit-warn { color: #e67e22; }
         .code-info .limit-over { color: #e74c3c; }
         .code-info .limit-ok { color: #2ecc71; }
-        .file-name {
-            color: #7fe0a0;
-            font-size: 12px;
-            margin-top: 4px;
-            font-style: italic;
-        }
-        .btn-row {
-            display: flex;
-            gap: 8px;
-            margin-top: 12px;
-            flex-wrap: wrap;
-        }
+        .file-name { color: #7fe0a0; font-size: 12px; margin-top: 4px; font-style: italic; }
+        .btn-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
         button.check-btn {
             flex: 1;
             min-width: 120px;
@@ -335,17 +341,9 @@ HTML_PAGE = """
             transition: background 0.2s;
         }
         button.clear-btn:hover, button.upload-btn:hover { background: var(--accent); color: #fff; }
-        button.upload-btn {
-            background: #2a1f3a;
-            color: #d0a0ff;
-            border-color: #4a2a5a;
-        }
+        button.upload-btn { background: #2a1f3a; color: #d0a0ff; border-color: #4a2a5a; }
         button.upload-btn:hover { background: #4a2a5a; color: #fff; }
-        button.zip-btn {
-            background: #3a2a1a;
-            color: #ffa94d;
-            border-color: #5a3a1a;
-        }
+        button.zip-btn { background: #3a2a1a; color: #ffa94d; border-color: #5a3a1a; }
         button.zip-btn:hover { background: #5a3a1a; color: #fff; }
         #fileInput, #zipInput { display: none; }
         #result {
@@ -429,10 +427,7 @@ HTML_PAGE = """
             font-size: 14px;
             line-height: 1.6;
         }
-        .no-problems b {
-            color: #66ccff;
-            font-weight: 700;
-        }
+        .no-problems b { color: #66ccff; font-weight: 700; }
         .severity-header {
             padding: 10px 14px;
             margin: 16px 0 10px 0;
@@ -539,6 +534,13 @@ HTML_PAGE = """
             font-size: 14px;
         }
         .modal-close:hover { background: #e74c3c; color: #fff; }
+        .modal code {
+            background: #0f1a26;
+            color: #a0d0ff;
+            padding: 1px 5px;
+            border-radius: 3px;
+            font-size: 12px;
+        }
         .history-item {
             padding: 10px 12px;
             margin-bottom: 8px;
@@ -555,11 +557,7 @@ HTML_PAGE = """
         .history-item .h-summary { color: var(--text-mid); font-size: 12px; margin-top: 4px; }
         .history-item:hover .h-time,
         .history-item:hover .h-summary { color: #fff; }
-        .history-empty {
-            color: var(--text-dim);
-            text-align: center;
-            padding: 20px;
-        }
+        .history-empty { color: var(--text-dim); text-align: center; padding: 20px; }
         .toast {
             position: fixed;
             bottom: 24px;
@@ -623,19 +621,20 @@ HTML_PAGE = """
 
         <p><b>Как пользоваться:</b></p>
         <ul>
-            <li><b>📁 Файл</b> — выбрать файл на компьютере. Язык определится по расширению. Файл больше 100 000 символов — обрежется.</li>
-            <li><b>📦 ZIP</b> — загрузить <code>.zip</code>, проверить весь проект. Пропускает <code>node_modules/</code>, <code>.git/</code>, <code>__pycache__/</code>, скрытые папки. Лимиты: 5 МБ, 100 файлов.</li>
-            <li><b>Drag &amp; drop</b> — перетащи файл в поле ввода.</li>
-            <li><b>Проверить</b> — запускает анализ. <code>Ctrl+Enter</code> — то же самое.</li>
+            <li><b>📁 Файл</b> — выбрать файл. Язык по расширению. Больше 100 000 символов — обрежется.</li>
+            <li><b>📦 ZIP</b> — проверить весь проект. Пропускает <code>node_modules/</code>, <code>.git/</code>, <code>__pycache__/</code> + применяет <code>.checkerignore</code>. Лимиты: 5 МБ, 100 файлов.</li>
+            <li><b>🚫 Игнор</b> — редактировать <code>.checkerignore</code> (как <code>.gitignore</code>).</li>
+            <li><b>Drag &amp; drop</b> — перетащи файл в поле.</li>
+            <li><b>Проверить</b> — запускает анализ. <code>Ctrl+Enter</code>.</li>
             <li><b>🗑 Очистить</b> — сброс. <code>Ctrl+L</code>.</li>
             <li><b>📜 История</b> — последние 10 проверок.</li>
-            <li><b>📋 Копировать</b> / <b>📥 TXT</b> / <b>📋 JSON</b> — экспорт отчёта.</li>
-            <li><b>Клик на проблему</b> — скопировать одну строку.</li>
+            <li><b>📋 Копировать / 📥 TXT / 📋 JSON</b> — экспорт отчёта.</li>
+            <li><b>Клик на проблему</b> — копировать одну строку.</li>
             <li><b>🔍 Поиск</b> + <b>фильтры</b> — по severity и категориям.</li>
-            <li><b>Esc</b> — закрыть окно истории.</li>
+            <li><b>Esc</b> — закрыть окно.</li>
         </ul>
 
-        <p class="warn">💡 0 проблем ≠ идеальный код. Помощник — это первый фильтр, а не замена ревью и аудиту. Всегда проверяй код вручную.</p>
+        <p class="warn">💡 0 проблем ≠ идеальный код. Помощник — это первый фильтр, а не замена ревью и аудиту.</p>
     </details>
 
     <main>
@@ -653,9 +652,10 @@ HTML_PAGE = """
             <div class="btn-row">
                 <button class="check-btn" id="check" title="Ctrl+Enter">Проверить</button>
                 <button class="upload-btn" id="upload" onclick="document.getElementById('fileInput').click()" title="Загрузить файл">📁 Файл</button>
-                <button class="zip-btn" id="uploadZip" onclick="document.getElementById('zipInput').click()" title="Загрузить ZIP-архив">📦 ZIP</button>
+                <button class="zip-btn" id="uploadZip" onclick="document.getElementById('zipInput').click()" title="Загрузить ZIP">📦 ZIP</button>
+                <button class="clear-btn" id="ignore" onclick="openIgnore()" title=".checkerignore">🚫 Игнор</button>
                 <button class="clear-btn" id="clear" onclick="clearAll()" title="Ctrl+L">🗑 Очистить</button>
-                <button class="clear-btn" id="history" onclick="openHistory()" title="История проверок">📜 История</button>
+                <button class="clear-btn" id="history" onclick="openHistory()" title="История">📜 История</button>
             </div>
             <input type="file" id="fileInput" accept=".py,.cpp,.cc,.cxx,.c,.h,.hpp,.html,.htm,.js,.mjs,.go,.txt" onchange="handleFileSelect(event)">
             <input type="file" id="zipInput" accept=".zip" onchange="handleZipSelect(event)">
@@ -684,6 +684,25 @@ HTML_PAGE = """
             <button class="modal-close" onclick="closeHistory()">✕</button>
             <h2>📜 История проверок</h2>
             <div id="historyList"><div class="history-empty">Пока пусто</div></div>
+        </div>
+    </div>
+
+    <div class="modal-overlay" id="ignoreModal" onclick="if (event.target === this) closeIgnore()">
+        <div class="modal">
+            <button class="modal-close" onclick="closeIgnore()">✕</button>
+            <h2>🚫 Настройки .checkerignore</h2>
+            <p style="color: var(--text-mid); font-size: 13px; margin-bottom: 12px; line-height: 1.5;">
+                Паттерны — по одному на строку. Формат как в <code>.gitignore</code>:
+                <br>• <code>tests/</code> — вся папка
+                <br>• <code>*.min.js</code> — все min.js файлы
+                <br>• <code>node_modules/</code> — из любого места
+                <br>• <code># комментарий</code> — игнорируется
+            </p>
+            <textarea id="ignoreText" placeholder="tests/&#10;migrations/&#10;*.min.js&#10;node_modules/" style="min-height: 250px; font-family: 'Consolas', monospace;"></textarea>
+            <div class="btn-row" style="margin-top: 12px;">
+                <button class="check-btn" onclick="saveIgnore()" style="flex: 1;">💾 Сохранить</button>
+                <button class="clear-btn" onclick="closeIgnore()">Отмена</button>
+            </div>
         </div>
     </div>
 
@@ -776,6 +795,60 @@ HTML_PAGE = """
             }, 2000);
         }
 
+        function escapeAttr(s) {
+            return String(s)
+                .replace(/&/g, '&amp;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
+
+        function escapeHtml(text) {
+            var div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        function copyToClipboard(text) {
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                return navigator.clipboard.writeText(text).catch(function() {
+                    fallbackCopy(text);
+                });
+            }
+            fallbackCopy(text);
+            return Promise.resolve();
+        }
+
+        function fallbackCopy(text) {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            try { document.execCommand('copy'); } catch(e) {}
+            document.body.removeChild(ta);
+        }
+
+        resultEl.addEventListener('click', function(e) {
+            var el = e.target.closest('.problem');
+            if (!el || !el.dataset.problem) return;
+            var encoded = el.dataset.problem;
+            try {
+                var item = JSON.parse(decodeURIComponent(encoded));
+                var marker = SEVERITY_MARKERS[item.severity] || '•';
+                var text = marker + ' Строка ' + item.line + ': ' + item.message;
+                copyToClipboard(text).then(function() {
+                    el.classList.add('copied');
+                    setTimeout(function() { el.classList.remove('copied'); }, 600);
+                    showToast('📋 Скопировано');
+                });
+            } catch (err) {
+                showToast('❌ Не удалось скопировать', '#a02020');
+            }
+        });
+
         var HISTORY_KEY = 'cc_history';
         var HISTORY_MAX = 10;
         function getHistory() {
@@ -834,6 +907,42 @@ HTML_PAGE = """
             renderProblemsInternal({problems: lastProblems, error: null}, resultEl, lastSourceName);
             closeHistory();
             showToast('📜 Загружено из истории');
+        }
+
+        async function openIgnore() {
+            document.getElementById('ignoreModal').classList.add('show');
+            var ta = document.getElementById('ignoreText');
+            ta.value = 'Загружаю...';
+            try {
+                var res = await fetch('/checkerignore');
+                var data = await res.json();
+                ta.value = data.content || '';
+            } catch (e) {
+                ta.value = '';
+                showToast('❌ Не удалось загрузить', '#a02020');
+            }
+        }
+        function closeIgnore() {
+            document.getElementById('ignoreModal').classList.remove('show');
+        }
+        async function saveIgnore() {
+            var ta = document.getElementById('ignoreText');
+            try {
+                var res = await fetch('/checkerignore', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({content: ta.value})
+                });
+                var data = await res.json();
+                if (data.status === 'ok') {
+                    showToast('💾 Сохранено в .checkerignore');
+                    closeIgnore();
+                } else {
+                    showToast('❌ Ошибка: ' + (data.error || 'неизвестно'), '#a02020');
+                }
+            } catch (e) {
+                showToast('❌ Ошибка: ' + e.message, '#a02020');
+            }
         }
 
         function handleFileSelect(event) {
@@ -1077,12 +1186,13 @@ HTML_PAGE = """
                 head.indexOf('=>') !== -1) {
                 return 'js';
             }
-              if (head.indexOf('package main') !== -1 ||
+            if (head.indexOf('package main') !== -1 ||
                 (head.indexOf('package ') !== -1 && head.indexOf('func ') !== -1) ||
                 head.indexOf(':= ') !== -1) {
                 return 'go';
             }
-            if (head.indexOf('def ') !== -1 || head.indexOf('print(') !== -1) {
+            if (head.indexOf('def ') !== -1 || head.indexOf('print(') !== -1 ||
+                head.indexOf('import ') !== -1) {
                 return 'py';
             }
             return null;
@@ -1146,11 +1256,8 @@ HTML_PAGE = """
         });
 
         var LANG_NAMES = {
-            'py': 'Python',
-            'cpp': 'C++',
-            'html': 'HTML',
-            'js': 'JavaScript',
-            'go': 'Go'
+            'py': 'Python', 'cpp': 'C++', 'html': 'HTML',
+            'js': 'JavaScript', 'go': 'Go'
         };
 
         function categoryLabel(key) {
@@ -1216,7 +1323,6 @@ HTML_PAGE = """
             currentCategoryFilter = null;
             rerender();
         }
-
         function setCategoryFilter(cat) {
             if (currentCategoryFilter === cat) {
                 currentCategoryFilter = null;
@@ -1226,7 +1332,6 @@ HTML_PAGE = """
             }
             rerender();
         }
-
         function rerender() {
             if (!lastProblems || lastProblems.length === 0) return;
             var filtered = getVisibleProblems();
@@ -1258,10 +1363,7 @@ HTML_PAGE = """
 
             var onlyInfo = true;
             for (var i = 0; i < data.problems.length; i++) {
-                if (data.problems[i].severity !== 'INFO') {
-                    onlyInfo = false;
-                    break;
-                }
+                if (data.problems[i].severity !== 'INFO') { onlyInfo = false; break; }
             }
 
             if (onlyInfo) {
@@ -1322,7 +1424,7 @@ HTML_PAGE = """
 
             var html = '';
             html += '<input class="search-box" type="text" placeholder="🔍 Найти в отчёте..." value="' +
-                    escapeHtml(currentSearchQuery) + '" oninput="setSearchQuery(this.value)">';
+                    escapeAttr(currentSearchQuery) + '" oninput="setSearchQuery(this.value)">';
             html += buildCounters(lastProblems);
             html += buildCategoryCounters(lastProblems);
 
@@ -1358,9 +1460,9 @@ HTML_PAGE = """
                         else if (item.severity === 'INFO') cls2 = 'problem info';
 
                         var marker = SEVERITY_MARKERS[item.severity] || '•';
-                        var itemJson = encodeURIComponent(JSON.stringify(item));
+                        var encoded = encodeURIComponent(JSON.stringify(item));
 
-                        html += '<div class="' + cls2 + '" onclick="copyOneProblem(this, \\'' + itemJson + '\\')" title="Клик — копировать">';
+                        html += '<div class="' + cls2 + '" data-problem="' + escapeAttr(encoded) + '" title="Клик — копировать">';
                         html += '<div class="line">' + marker + ' Строка ' + item.line + '</div>';
                         html += '<div class="msg">' + escapeHtml(item.message) + '</div>';
                         html += '</div>';
@@ -1368,42 +1470,6 @@ HTML_PAGE = """
                 }
             }
             container.innerHTML = html;
-        }
-
-        function copyOneProblem(el, encoded) {
-            try {
-                var item = JSON.parse(decodeURIComponent(encoded));
-                var text = SEVERITY_MARKERS[item.severity] + ' Строка ' + item.line + ': ' + item.message;
-                if (navigator.clipboard && navigator.clipboard.writeText) {
-                    navigator.clipboard.writeText(text).then(function() {
-                        el.classList.add('copied');
-                        setTimeout(function() { el.classList.remove('copied'); }, 600);
-                        showToast('📋 Скопировано');
-                    }).catch(function() {
-                        fallbackCopy(text);
-                        el.classList.add('copied');
-                        setTimeout(function() { el.classList.remove('copied'); }, 600);
-                    });
-                } else {
-                    fallbackCopy(text);
-                    el.classList.add('copied');
-                    setTimeout(function() { el.classList.remove('copied'); }, 600);
-                    showToast('📋 Скопировано');
-                }
-            } catch (e) {
-                showToast('❌ Не удалось', '#a02020');
-            }
-        }
-
-        function fallbackCopy(text) {
-            var ta = document.createElement('textarea');
-            ta.value = text;
-            ta.style.position = 'fixed';
-            ta.style.left = '-9999px';
-            document.body.appendChild(ta);
-            ta.select();
-            try { document.execCommand('copy'); } catch(e) {}
-            document.body.removeChild(ta);
         }
 
         async function checkCode() {
@@ -1418,8 +1484,6 @@ HTML_PAGE = """
 
             if (code.length > 100000) {
                 code = code.substring(0, 100000);
-                codeEl.value = code;
-                updateCodeInfo();
                 showToast('⚠ Код обрезан до 100 000 символов', '#a06020');
             }
 
@@ -1482,7 +1546,6 @@ HTML_PAGE = """
 
             try {
                 var res = await fetch('/check-self', {method: 'GET'});
-
                 if (res.status === 429) {
                     resultEl.innerHTML = '<div class="error">Слишком много запросов. Подожди минуту.</div>';
                     return;
@@ -1493,7 +1556,6 @@ HTML_PAGE = """
                 }
 
                 var data = await res.json();
-
                 if (!data.results) {
                     resultEl.innerHTML = '<div class="error">Сервер вернул неверный ответ.</div>';
                     return;
@@ -1510,7 +1572,6 @@ HTML_PAGE = """
                     var tmp = document.createElement('div');
                     renderProblems({problems: item.problems, error: null}, tmp, item.file);
                     html += tmp.innerHTML;
-
                     html += '</div>';
 
                     for (var j = 0; j < item.problems.length; j++) {
@@ -1579,20 +1640,13 @@ HTML_PAGE = """
         async function copyReport() {
             var text = buildReportText();
             if (!text) return;
-            if (navigator.clipboard && navigator.clipboard.writeText) {
-                try {
-                    await navigator.clipboard.writeText(text);
-                    copyBtn.textContent = '✅ Скопировано!';
-                    copyBtn.classList.add('copied');
-                    setTimeout(function() {
-                        copyBtn.textContent = '📋 Копировать';
-                        copyBtn.classList.remove('copied');
-                    }, 2000);
-                    showToast('📋 Отчёт скопирован');
-                    return;
-                } catch (e) {}
-            }
-            fallbackCopy(text);
+            await copyToClipboard(text);
+            copyBtn.textContent = '✅ Скопировано!';
+            copyBtn.classList.add('copied');
+            setTimeout(function() {
+                copyBtn.textContent = '📋 Копировать';
+                copyBtn.classList.remove('copied');
+            }, 2000);
             showToast('📋 Отчёт скопирован');
         }
 
@@ -1625,7 +1679,7 @@ HTML_PAGE = """
             }
             var report = {
                 tool: 'Code Checker',
-                version: 'v16.10',
+                version: 'v16.15',
                 date: new Date().toISOString(),
                 source: lastSourceName,
                 language: currentLang,
@@ -1651,27 +1705,19 @@ HTML_PAGE = """
             showToast('📋 JSON скачан');
         }
 
-        function escapeHtml(text) {
-            var div = document.createElement('div');
-            div.textContent = text;
-            return div.innerHTML;
-        }
-
         document.addEventListener('keydown', function(e) {
             if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
-                e.preventDefault();
-                checkCode();
+                e.preventDefault(); checkCode();
             }
             if ((e.ctrlKey || e.metaKey) && (e.key === 'l' || e.key === 'L' || e.key === 'д' || e.key === 'Д')) {
-                e.preventDefault();
-                clearAll();
+                e.preventDefault(); clearAll();
             }
             if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S' || e.key === 'ы' || e.key === 'Ы')) {
                 e.preventDefault();
                 if (!downloadBtn.disabled) downloadReport();
             }
             if (e.key === 'Escape') {
-                closeHistory();
+                closeHistory(); closeIgnore();
             }
         });
 
@@ -1681,6 +1727,46 @@ HTML_PAGE = """
 </body>
 </html>
 """
+
+
+# ============ .checkerignore ============
+
+def _load_checkerignore():
+    if not CHECKERIGNORE_FILE.exists():
+        return []
+    try:
+        text = CHECKERIGNORE_FILE.read_text(encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Не удалось прочитать .checkerignore: {e}")
+        return []
+    patterns = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        patterns.append(line)
+    return patterns
+
+
+def _is_ignored(name, patterns):
+    if not patterns:
+        return False
+    normalized = name.replace("\\", "/")
+    parts = normalized.split("/")
+    for pat in patterns:
+        p = pat.rstrip("/")
+        if "/" in p:
+            if fnmatch.fnmatch(normalized, p) or fnmatch.fnmatch(normalized, p + "/*"):
+                return True
+            if fnmatch.fnmatch(normalized, pat):
+                return True
+        else:
+            for part in parts:
+                if fnmatch.fnmatch(part, p):
+                    return True
+        if fnmatch.fnmatch(normalized, pat):
+            return True
+    return False
 
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
@@ -1725,11 +1811,8 @@ def _detect_language_from_code(code: str, filename: str = "code.py") -> str:
 
 def _get_suffix(lang: str) -> str:
     suffix_map = {
-        "python": ".py",
-        "cpp": ".cpp",
-        "html": ".html",
-        "js": ".js",
-        "go": ".go",
+        "python": ".py", "cpp": ".cpp", "html": ".html",
+        "js": ".js", "go": ".go",
     }
     return suffix_map.get(lang, ".py")
 
@@ -1738,7 +1821,8 @@ async def _save_and_analyze(code: str, suffix: str):
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=suffix, delete=False, encoding="utf-8"
+            mode="w", suffix=suffix, delete=False, encoding="utf-8",
+            dir=str(TMP_DIR),
         ) as f:
             f.write(code)
             tmp_path = f.name
@@ -1823,11 +1907,35 @@ async def check_self(request: Request):
     return {"results": results}
 
 
+@app.get("/checkerignore")
+async def get_checkerignore():
+    if not CHECKERIGNORE_FILE.exists():
+        return {"content": "", "exists": False}
+    try:
+        text = CHECKERIGNORE_FILE.read_text(encoding="utf-8")
+        return {"content": text, "exists": True}
+    except Exception as e:
+        return {"content": "", "exists": False, "error": str(e)}
+
+
+@app.post("/checkerignore")
+async def save_checkerignore(payload: CheckerignoreRequest, request: Request):
+    client_ip = request.client.host if request.client else "unknown"
+    if not check_rate(client_ip):
+        raise HTTPException(status_code=429, detail="Too many requests")
+    try:
+        CHECKERIGNORE_FILE.write_text(payload.content, encoding="utf-8")
+        return {"status": "ok"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
 # ============ ZIP-АНАЛИЗ ============
 
 ZIP_MAX_SIZE = 5 * 1024 * 1024
 ZIP_MAX_FILES = 100
 ZIP_MAX_FILE_SIZE = 100000
+ZIP_MAX_TOTAL_UNPACKED = 50 * 1024 * 1024
 
 ZIP_SKIP_DIRS = {
     "node_modules", "__pycache__", ".git", ".venv", "venv", "env",
@@ -1841,31 +1949,71 @@ ZIP_ALLOWED_EXTS = {
 }
 
 
+def _should_skip_zip_entry(name, patterns):
+    """Проверяет, надо ли пропустить файл из архива."""
+    if name.endswith("/"):
+        return True
+    normalized = name.replace("\\", "/")
+    parts = normalized.split("/")
+    if any(p.startswith(".") or p in ZIP_SKIP_DIRS for p in parts):
+        return True
+    if _is_ignored(normalized, patterns):
+        return True
+    ext = Path(name).suffix.lower()
+    if ext not in ZIP_ALLOWED_EXTS:
+        return True
+    return False
+
+
 def _zip_collect_files(zf):
+    """
+    Возвращает (collected, truncated).
+    Защита от zip-бомб: размер распакованного файла проверяется по заголовку
+    ДО вызова zf.read(), плюс общий лимит на суммарный распакованный объём.
+    """
     collected = []
     truncated = False
+    patterns = _load_checkerignore()
+    total_unpacked = 0
+
     for name in zf.namelist():
-        if name.endswith("/"):
-            continue
-        normalized = name.replace("\\", "/")
-        parts = normalized.split("/")
-        if any(p.startswith(".") or p in ZIP_SKIP_DIRS for p in parts):
-            continue
-        ext = Path(name).suffix.lower()
-        if ext not in ZIP_ALLOWED_EXTS:
+        if _should_skip_zip_entry(name, patterns):
             continue
         if len(collected) >= ZIP_MAX_FILES:
             truncated = True
             break
+
+        try:
+            info = zf.getinfo(name)
+        except KeyError:
+            continue
+
+        if info.file_size > ZIP_MAX_FILE_SIZE:
+            logger.warning(
+                f"Пропущен {name}: распакованный размер "
+                f"{info.file_size} байт > {ZIP_MAX_FILE_SIZE}"
+            )
+            continue
+
+        total_unpacked += info.file_size
+        if total_unpacked > ZIP_MAX_TOTAL_UNPACKED:
+            logger.warning(
+                f"Суммарный распакованный объём превышен: "
+                f"{total_unpacked} > {ZIP_MAX_TOTAL_UNPACKED}"
+            )
+            truncated = True
+            break
+
         try:
             raw = zf.read(name)
             content = raw.decode("utf-8", errors="replace")
         except Exception as e:
             logger.warning(f"Не удалось прочитать {name}: {e}")
             continue
-        if len(content) > ZIP_MAX_FILE_SIZE:
-            content = content[:ZIP_MAX_FILE_SIZE]
-        collected.append((normalized, content, ext))
+
+        normalized = name.replace("\\", "/")
+        collected.append((normalized, content, Path(name).suffix.lower()))
+
     return collected, truncated
 
 
@@ -1873,7 +2021,8 @@ async def _zip_analyze_one(name, content, ext):
     tmp_path = None
     try:
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=ext, delete=False, encoding="utf-8"
+            mode="w", suffix=ext, delete=False, encoding="utf-8",
+            dir=str(TMP_DIR),
         ) as tf:
             tf.write(content)
             tmp_path = tf.name
@@ -1896,6 +2045,9 @@ async def check_zip_endpoint(request: Request, file: UploadFile = File(...)):
     client_ip = request.client.host if request.client else "unknown"
     if not check_rate(client_ip):
         raise HTTPException(status_code=429, detail="Too many requests")
+
+    if file is None or not file.filename:
+        return {"error": "Файл не передан"}
 
     try:
         data = await file.read()
@@ -1937,4 +2089,4 @@ async def check_zip_endpoint(request: Request, file: UploadFile = File(...)):
 # ============ ЗАПУСК ============
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=8000, workers=1)
