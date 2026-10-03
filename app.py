@@ -33,6 +33,9 @@ logger = logging.getLogger("CodeCheckerWeb")
 
 app = FastAPI(title="Code Checker")
 
+from fastapi.staticfiles import StaticFiles
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
