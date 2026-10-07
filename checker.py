@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Code Checker v16.0 — Python + C++ + HTML + JS + Go"""
+"""Code Checker v17.10.2 — Python + C++ + HTML + JS + Go + taint analysis"""
 
 import ast
 import re
@@ -29,6 +29,10 @@ CAT_FSTRINGS = "fstrings"
 CAT_LINE_LENGTH = "line_length"
 CAT_MEMORY = "memory"
 CAT_XSS = "xss"
+CAT_OBFUSCATION = "obfuscation"
+CAT_LOGIC = "logic"
+CAT_RESOURCES = "resources"
+CAT_TAINT = "taint"
 CAT_OTHER = "other"
 
 FSTRING_TYPES = (ast.JoinedStr,)
@@ -69,8 +73,17 @@ SECRET_PATTERNS = [
 SECRET_FUNC_WORDS = ("password", "passwd", "pwd", "secret", "token", "api_key", "apikey")
 
 SECRET_VAR_WORDS = re.compile(
-    r'(?i)(?:^|[_\W])(?:.*?(?:TOKEN|KEY|SECRET|PASS|SID|CREDENTIAL|AUTH|APIKEY|WEBHOOK|DSN|URI|URL).*?)(?:[_\W]|$)'
+    r'(?i)(?:^|[_\W])(?:.*?(?:TOKEN|KEY|SECRET|PASS|SID|CREDENTIAL|AUTH|APIKEY|WEBHOOK|DSN).*?)(?:[_\W]|$)'
 )
+
+SAFE_VAR_NAMES = {
+    "base_url", "api_url", "cdn_url", "image_url", "avatar_url",
+    "callback_url", "redirect_url", "home_url", "site_url",
+    "source_url", "target_url", "url", "uri",
+    "public_key", "key_name", "key_id", "key_type",
+    "auth_method", "auth_type", "sid_type",
+    "webhook_url", "webhook_path",
+}
 
 SAFE_VALUES = {
     "test", "tests", "dummy", "example", "sample", "fake",
@@ -124,13 +137,274 @@ PY_INSECURE_REGEX = [
     (r'\bshelve\.open\s*\(', "`shelve.open()` — использует pickle, небезопасно"),
     (r'\bbreakpoint\s*\(\s*\)', "`breakpoint()` — дебаг в коде"),
     (r'\bpdb\.set_trace\s*\(', "`pdb.set_trace()` — дебаг в коде"),
-    (r'\brender_template_string\s*\(', "`render_template_string()` — SSTI-уязвимость"),
+    (r'\brender_template_string\s*\(', "`render_template_string()` — SSTI-уязвимость"),  # noqa
     (r'\bjinja2\.Template\s*\(', "`jinja2.Template()` — SSTI-уязвимость"),
     (r'\bmako\.template\.Template\s*\(', "`mako.template.Template()` — SSTI-уязвимость"),
     (r'\bssl\._create_unverified_context\s*\(', "`ssl._create_unverified_context()` — отключает SSL"),
     (r'\bsetattr\s*\(\s*builtins\s*,', "`setattr(builtins, ...)` — подмена builtins"),
     (r'\bglobals\s*\(\s*\)\s*\[', "`globals()[...]` — динамический доступ к переменным"),
     (r'\blocals\s*\(\s*\)\s*\[', "`locals()[...]` — динамический доступ к переменным"),
+]
+
+PY_NEW_INSECURE = [
+    (r'\brequests\.(?:get|post|put|delete|patch|head|request)\s*\((?![^)]*timeout)',
+     "`requests` без `timeout` — может зависнуть навсегда", "MEDIUM", CAT_NETWORK),
+    (r'\bhttpx\.(?:get|post|put|delete|patch|head|request)\s*\((?![^)]*timeout)',
+     "`httpx` без `timeout` — может зависнуть", "MEDIUM", CAT_NETWORK),
+    (r'\bsubprocess\.\w+\s*\([^)]*shell\s*=\s*True',
+     "`subprocess` с `shell=True` — RCE-риск", "CRITICAL", CAT_SHELL),
+    (r'\bdatetime\.utcnow\s*\(\s*\)',
+     "`datetime.utcnow()` устарел в Python 3.12+, используй `datetime.now(timezone.utc)`", "MEDIUM", CAT_STYLE),
+    (r'\bdatetime\.utcfromtimestamp\s*\(',
+     "`datetime.utcfromtimestamp()` устарел, используй `datetime.fromtimestamp(ts, tz=timezone.utc)`", "MEDIUM", CAT_STYLE),
+    (r'\bopen\s*\((?![^)]*encoding)',
+     "`open()` без `encoding` — на Windows будет cp1251 вместо utf-8", "MEDIUM", CAT_FILES),
+    (r'\braw_input\s*\(',
+     "`raw_input()` — Python 2, используй `input()`", "HIGH", CAT_STYLE),
+    (r'\bos\.getcwd\s*\(\s*\)',
+     "`os.getcwd()` — используй `Path.cwd()` (pathlib)", "LOW", CAT_STYLE),
+    (r'\btype\s*\([^)]+\)\s*==',
+     "`type() ==` — используй `isinstance()`", "MEDIUM", CAT_COMPARISONS),
+    (r'["\'](?:cp1251|windows-1251|koi8-r)["\']',
+     "Хардкод старой кодировки — используй utf-8", "MEDIUM", CAT_STYLE),
+    (r'logging\.(?:info|debug|warning|error|critical)\s*\(',
+     "Вызов `logging` без `basicConfig` — может не выводиться", "LOW", CAT_LOGGING),
+    (r'def\s+__init__\s*\(\s*self\s*\)\s*:\s*\n\s*pass',
+     "Пустой `__init__` — можно удалить", "LOW", CAT_STYLE),
+    (r'isinstance\s*\([^,]+,\s*\([^,)]+,\s*\)\s*\)',
+     "`isinstance` с кортежем из одного типа — убери запятую", "LOW", CAT_STYLE),
+    (r'f["\'][^"\']*\{\s*\}[^"\']*["\']',
+     "f-string с пустыми `{}` — ошибка", "HIGH", CAT_FSTRINGS),
+    (r'(\bor\b[^;\n]{50,}){3,}',
+     "Длинная цепочка `or` — упрости через `in`", "LOW", CAT_STYLE),
+    (r'\bmark_safe\s*\(', "Django `mark_safe()` отключает авто-экранирование — XSS", "HIGH", CAT_XSS),
+    (r'@csrf_exempt\b', "Django `@csrf_exempt` отключает CSRF-защиту", "HIGH", CAT_DANGEROUS),
+    (r'\.raw\s*\(\s*f["\']', "Django `.raw()` с f-строкой — SQL-инъекция", "CRITICAL", CAT_SQL),
+    (r'\.extra\s*\([^)]*(?:where|select)\s*=\s*f["\']', "Django `.extra()` с f-строкой — SQL-инъекция", "CRITICAL", CAT_SQL),
+    (r'app\.run\s*\([^)]*debug\s*=\s*True', "Flask `debug=True` в продакшене — RCE-риск", "CRITICAL", CAT_DANGEROUS),
+    (r'\bsend_file\s*\((?![^)]*safe_join)', "`send_file()` без `safe_join()` — path traversal", "HIGH", CAT_PATHS),
+    (r'\btext\s*\(\s*f["\']', "SQLAlchemy `text()` с f-строкой — SQL-инъекция", "CRITICAL", CAT_SQL),
+    (r'\.execute\s*\(\s*f["\']', "`execute()` с f-строкой — SQL-инъекция", "CRITICAL", CAT_SQL),
+    (r'requests\.(?:get|post|put|delete|head|request)\s*\(\s*(?!["\'])\w+', "SSRF: URL из переменной в `requests` — проверь валидацию", "MEDIUM", CAT_NETWORK),
+]
+
+PY_OBFUSCATION_PATTERNS = [
+    (r'\bexec\s*\(\s*base64\.(?:b64decode|decodebytes|standard_b64decode|urlsafe_b64decode)',
+     "`exec(base64...)` — обфускация кода через base64", "CRITICAL", CAT_OBFUSCATION),
+    (r'\beval\s*\(\s*base64\.(?:b64decode|decodebytes|standard_b64decode|urlsafe_b64decode)',
+     "`eval(base64...)` — обфускация кода через base64", "CRITICAL", CAT_OBFUSCATION),
+    (r'\bexec\s*\(\s*bytes\.fromhex\s*\(',
+     "`exec(bytes.fromhex(...))` — обфускация через hex", "CRITICAL", CAT_OBFUSCATION),
+    (r'\beval\s*\(\s*bytes\.fromhex\s*\(',
+     "`eval(bytes.fromhex(...))` — обфускация через hex", "CRITICAL", CAT_OBFUSCATION),
+    (r'\bexec\s*\(\s*(?:chr\s*\([^)]+\)\s*\+?\s*){2,}',
+     "`exec(chr(...)+chr(...))` — обфускация через chr", "CRITICAL", CAT_OBFUSCATION),
+    (r'\beval\s*\(\s*(?:chr\s*\([^)]+\)\s*\+?\s*){2,}',
+     "`eval(chr(...)+chr(...))` — обфускация через chr", "CRITICAL", CAT_OBFUSCATION),
+    (r'\bexec\s*\(\s*["\'][^"\']*["\']\.encode\s*\(\s*["\'](?:rot13|base64|hex)',
+     "`exec(\"...\".encode(\"rot13\"))` — обфускация", "CRITICAL", CAT_OBFUSCATION),
+    (r'\bcodecs\.(?:decode|encode)\s*\([^,]+,\s*["\']rot[-_]?13',
+     "`codecs.decode(..., \"rot13\")` — обфускация через rot13", "HIGH", CAT_OBFUSCATION),
+    (r'\bgetattr\s*\(\s*(?:__builtins__|builtins)\s*,',
+     "`getattr(builtins, ...)` — динамический доступ к builtins", "HIGH", CAT_OBFUSCATION),
+    (r'\bgetattr\s*\(\s*[\'"]builtins[\'"]\s*,',
+     "`getattr(\"builtins\", ...)` — динамический доступ к модулям", "HIGH", CAT_OBFUSCATION),
+    (r'\b__builtins__\b',
+     "`__builtins__` — прямой доступ к builtins, опасно", "HIGH", CAT_OBFUSCATION),
+    (r'\bcompile\s*\([^)]*\)\s*(?:,|\))',
+     "`compile()` — динамическая компиляция, потенциальная обфускация", "MEDIUM", CAT_OBFUSCATION),
+    (r'\bsys\._getframe\s*\(',
+     "`sys._getframe()` — доступ к стеку фреймов (рефлексия)", "HIGH", CAT_OBFUSCATION),
+    (r'\.f_globals\b|\.f_locals\b',
+     "Доступ к `f_globals`/`f_locals` — рефлексия через фреймы", "HIGH", CAT_OBFUSCATION),
+    (r'\btype\s*\(\s*["\'][^"\']+["\']\s*,\s*\([^)]*\)\s*,\s*\{',
+     "`type(\"X\", (), {...})` — динамическое создание класса", "MEDIUM", CAT_OBFUSCATION),
+    (r'\binspect\.(?:getsource|getsourcefile|getsourcelines|getmembers|getframeinfo)\s*\(',
+     "`inspect.get*()` — интроспекция кода", "MEDIUM", CAT_OBFUSCATION),
+    (r'\bimportlib\.reload\s*\(',
+     "`importlib.reload()` — перезагрузка модуля (побочные эффекты)", "MEDIUM", CAT_OBFUSCATION),
+    (r'\bctypes\.(?:CDLL|WinDLL|cdll|windll|CFUNCTYPE|POINTER)\s*\(',
+     "`ctypes` — вызов C-функций напрямую, опасно", "HIGH", CAT_OBFUSCATION),
+    (r'\bmemoryview\s*\(',
+     "`memoryview()` — низкоуровневый доступ к памяти", "LOW", CAT_OBFUSCATION),
+    (r'\b__import__\s*\(\s*["\'][^"\']+["\']\s*\)',
+     "`__import__(\"...\")` — динамический импорт", "MEDIUM", CAT_OBFUSCATION),
+    (r'\bgetattr\s*\([^,]+,\s*["\'][^"\']+["\']\s*\+',
+     "`getattr()` с конкатенацией строк — потенциальный обход", "HIGH", CAT_OBFUSCATION),
+    (r'["\'][^"\']*["\']\s*\+\s*["\'][^"\']*["\']\s*\+\s*["\'][^"\']*["\']\s*\+\s*["\'][^"\']*["\']',
+     "Склейка 4+ строк — потенциальная обфускация", "LOW", CAT_OBFUSCATION),
+    (r'\bexec\s*\(\s*(?:\([^)]*\)|\[[^\]]*\]|join\s*\()',
+     "`exec(...)` со структурой данных — вероятная обфускация", "CRITICAL", CAT_OBFUSCATION),
+]
+
+PY_LOGIC_PATTERNS = [
+    (r'^\s*if\s+[^:]+==\s*True\s*:\s*$', "`if x == True:` — используй `if x:`", "LOW", CAT_LOGIC),
+    (r'^\s*if\s+[^:]+==\s*False\s*:\s*$', "`if x == False:` — используй `if not x:`", "LOW", CAT_LOGIC),
+    (r'^\s*if\s+[^:]+!=\s*True\s*:\s*$', "`if x != True:` — используй `if not x:`", "LOW", CAT_LOGIC),
+    (r'^\s*if\s+[^:]+!=\s*False\s*:\s*$', "`if x != False:` — используй `if x:`", "LOW", CAT_LOGIC),
+    (r'^\s*if\s+len\s*\([^)]+\)\s*==\s*0\s*:\s*$', "`if len(x) == 0:` — используй `if not x:`", "LOW", CAT_LOGIC),
+    (r'^\s*if\s+len\s*\([^)]+\)\s*>\s*0\s*:\s*$', "`if len(x) > 0:` — используй `if x:`", "LOW", CAT_LOGIC),
+    (r'^\s*if\s+len\s*\([^)]+\)\s*!=\s*0\s*:\s*$', "`if len(x) != 0:` — используй `if x:`", "LOW", CAT_LOGIC),
+    (r'\breturn\s+True\s+if\s+[^:]+\s+else\s+False\b', "`return True if x else False` — используй `return bool(x)`", "LOW", CAT_LOGIC),
+    (r'\breturn\s+False\s+if\s+[^:]+\s+else\s+True\b', "`return False if x else True` — используй `return not x`", "LOW", CAT_LOGIC),
+    (r'\bbool\s*\([^)]+\)\s*==\s*True\b', "`bool(x) == True` — используй `if x:`", "LOW", CAT_LOGIC),
+    (r'\bbool\s*\([^)]+\)\s*==\s*False\b', "`bool(x) == False` — используй `if not x:`", "LOW", CAT_LOGIC),
+    (r'^\s*(\w+)\s*=\s*\1\s*$', "`x = x` — самоприсваивание", "MEDIUM", CAT_LOGIC),
+    (r'^\s*(\w+)\s*=\s*\1\s*\+\s*0\s*$', "`x = x + 0` — бессмысленная операция", "LOW", CAT_LOGIC),
+    (r'^\s*(\w+)\s*=\s*\1\s*\*\s*1\s*$', "`x = x * 1` — бессмысленная операция", "LOW", CAT_LOGIC),
+    (r'\bif\s+[^:]+\s+is\s+True\s+is\s+True\b', "`x is True is True` — цепочка сравнений, баг", "HIGH", CAT_LOGIC),
+    (r'^\s*while\s+True\s*:\s*pass\s*$', "`while True: pass` — бесконечный цикл без break", "HIGH", CAT_LOGIC),
+    (r'^\s*while\s+1\s*:\s*pass\s*$', "`while 1: pass` — бесконечный цикл без break", "HIGH", CAT_LOGIC),
+    (r'\bif\s+[^:]+\s*==\s*None\s+or\s+[^:]+\s*==\s*None\b', "`x == None or y == None` — используй `is None`", "MEDIUM", CAT_LOGIC),
+    (r'\bif\s+[^:]+\s*==\s*None\s+or\s+[^:]+\s*==\s*["\']["\']', "`x == None or x == \"\"` — используй `if not x:`", "LOW", CAT_LOGIC),
+    (r'^\s*if\s+not\s+\w+\s*==\s*\w+\s*:\s*$', "`if not x == y:` — используй `if x != y:`", "LOW", CAT_LOGIC),
+    (r'\bassert\s+[^,]+,\s*None\b', "`assert x, None` — бессмысленное сообщение", "LOW", CAT_LOGIC),
+    (r'^\s*for\s+\w+\s+in\s+range\s*\(\s*len\s*\([^)]+\)\s*\)\s*:', "`for i in range(len(x))` — используй `for i, item in enumerate(x)`", "LOW", CAT_LOGIC),
+]
+
+PY_TAINT_SOURCES = {
+    "request.args.get", "request.args",
+    "request.form.get", "request.form",
+    "request.json", "request.data",
+    "request.values", "request.cookies", "request.headers",
+    "request.get_json",
+    "request.GET.get", "request.GET", "request.POST.get", "request.POST",
+    "request.body",
+    "input", "raw_input",
+    "sys.argv",
+    "os.environ.get", "os.getenv",
+}
+
+PY_TAINT_SINKS = {
+    "cursor.execute":     ("CRITICAL", "Taint → SQL-инъекция: данные из источника попали в `execute()`", CAT_SQL),
+    "cursor.executemany": ("CRITICAL", "Taint → SQL-инъекция: данные из источника попали в `executemany()`", CAT_SQL),
+    "db.execute":         ("CRITICAL", "Taint → SQL-инъекция: данные из источника попали в `execute()`", CAT_SQL),
+    "connection.execute": ("CRITICAL", "Taint → SQL-инъекция: данные из источника попали в `execute()`", CAT_SQL),
+    "session.execute":    ("CRITICAL", "Taint → SQL-инъекция: данные из источника попали в `execute()`", CAT_SQL),
+    "engine.execute":     ("CRITICAL", "Taint → SQL-инъекция: данные из источника попали в `execute()`", CAT_SQL),
+    "os.system":               ("CRITICAL", "Taint → RCE: данные из источника попали в `os.system()`", CAT_SHELL),
+    "os.popen":                ("CRITICAL", "Taint → RCE: данные из источника попали в `os.popen()`", CAT_SHELL),
+    "subprocess.run":          ("CRITICAL", "Taint → RCE: данные из источника попали в `subprocess.run()`", CAT_SHELL),
+    "subprocess.call":         ("CRITICAL", "Taint → RCE: данные из источника попали в `subprocess.call()`", CAT_SHELL),
+    "subprocess.Popen":        ("CRITICAL", "Taint → RCE: данные из источника попали в `subprocess.Popen()`", CAT_SHELL),
+    "subprocess.check_output": ("CRITICAL", "Taint → RCE: данные из источника попали в `check_output()`", CAT_SHELL),
+    "eval":    ("CRITICAL", "Taint → RCE: данные из источника попали в `eval()`", CAT_DANGEROUS),
+    "exec":    ("CRITICAL", "Taint → RCE: данные из источника попали в `exec()`", CAT_DANGEROUS),
+    "compile": ("CRITICAL", "Taint → RCE: данные из источника попали в `compile()`", CAT_DANGEROUS),
+    "open":                ("HIGH", "Taint → Path traversal: данные из источника попали в `open()`", CAT_PATHS),
+    "send_file":           ("HIGH", "Taint → Path traversal: данные из источника попали в `send_file()`", CAT_PATHS),
+    "send_from_directory": ("HIGH", "Taint → Path traversal: данные из источника попали в `send_from_directory()`", CAT_PATHS),
+    "render_template_string": ("CRITICAL", "Taint → SSTI: данные из источника попали в `render_template_string()`", CAT_XSS),  # noqa
+    "Markup":                 ("HIGH", "Taint → XSS: данные из источника попали в `Markup()`", CAT_XSS),
+    "mark_safe":              ("HIGH", "Taint → XSS: данные из источника попали в `mark_safe()`", CAT_XSS),
+    "pickle.loads": ("CRITICAL", "Taint → RCE: данные из источника попали в `pickle.loads()`", CAT_DESERIALIZATION),
+    "yaml.load":    ("HIGH", "Taint → Deserialization: данные из источника попали в `yaml.load()`", CAT_DESERIALIZATION),
+}
+
+PY_TAINT_SANITIZERS = {
+    "int", "float", "bool", "str",
+    "escape", "html.escape", "markupsafe.escape",
+    "quote", "urllib.parse.quote",
+    "shlex.quote",
+    "secure_filename", "werkzeug.utils.secure_filename",
+    "bleach.clean",
+}
+
+PY_RESOURCE_PATTERNS = [
+    (r'^\s*(\w+)\s*=\s*subprocess\.Popen\s*\(',
+     "`subprocess.Popen()` без `.wait()` или `.communicate()` — зомби-процесс", "HIGH", CAT_RESOURCES),
+    (r'^\s*(\w+)\s*=\s*multiprocessing\.Pool\s*\(',
+     "`multiprocessing.Pool()` без `.close()` и `.join()` — утечка процессов", "HIGH", CAT_RESOURCES),
+    (r'^\s*(\w+)\s*=\s*ThreadPoolExecutor\s*\(',
+     "`ThreadPoolExecutor()` без `with` — потоки не завершатся", "MEDIUM", CAT_RESOURCES),
+    (r'^\s*(\w+)\s*=\s*ProcessPoolExecutor\s*\(',
+     "`ProcessPoolExecutor()` без `with` — процессы не завершатся", "MEDIUM", CAT_RESOURCES),
+    (r'\bqueue\.Queue\s*\(\s*\)\.get\s*\(\s*\)',
+     "`queue.get()` без `timeout` — может зависнуть навсегда", "MEDIUM", CAT_RESOURCES),
+    (r'^\s*(\w+)\s*=\s*io\.StringIO\s*\(',
+     "`io.StringIO()` без `.close()` — утечка памяти", "LOW", CAT_RESOURCES),
+    (r'^\s*(\w+)\s*=\s*io\.BytesIO\s*\(',
+     "`io.BytesIO()` без `.close()` — утечка памяти", "LOW", CAT_RESOURCES),
+    (r'tempfile\.NamedTemporaryFile\s*\([^)]*delete\s*=\s*False',
+     "`NamedTemporaryFile(delete=False)` — файл надо удалить вручную", "MEDIUM", CAT_RESOURCES),
+    (r'tempfile\.TemporaryDirectory\s*\(\s*\)(?!\s*\)\s*as)',
+     "`TemporaryDirectory()` без `with` — не удалится автоматически", "MEDIUM", CAT_RESOURCES),
+]
+
+PY_RESOURCE_AST_CALLS = {
+    "requests.Session": "`requests.Session()` без `with` или `.close()` — утечка соединений",
+    "aiohttp.ClientSession": "`aiohttp.ClientSession()` без `async with` — утечка соединений",
+    "socket.socket": "`socket.socket()` без `.close()` — утечка сокета",
+    "sqlite3.connect": "`sqlite3.connect()` без `.close()` — утечка БД",
+    "urllib.request.urlopen": "`urllib.request.urlopen()` без `with` — утечка соединения",
+    "zipfile.ZipFile": "`zipfile.ZipFile()` без `with` — файл не закроется",
+}
+
+CATEGORY_WEIGHTS = {
+    CAT_SECRETS: 20, CAT_SQL: 15, CAT_SHELL: 15, CAT_DESERIALIZATION: 10,
+    CAT_DANGEROUS: 12, CAT_XSS: 12, CAT_CRYPTO: 8, CAT_NETWORK: 5,
+    CAT_ERROR_HANDLING: 8, CAT_PATHS: 4, CAT_MEMORY: 10, CAT_STYLE: 2,
+    CAT_COMPARISONS: 3, CAT_LOGGING: 2, CAT_NOTES: 1, CAT_IMPORTS: 2,
+    CAT_FSTRINGS: 3, CAT_LINE_LENGTH: 1, CAT_ASSERT: 5, CAT_FILES: 4,
+    CAT_OBFUSCATION: 18, CAT_LOGIC: 4, CAT_RESOURCES: 6, CAT_TAINT: 20,
+    CAT_OTHER: 1,
+}
+
+CWE_MAP = {
+    CAT_SECRETS: "CWE-798", CAT_SQL: "CWE-89", CAT_SHELL: "CWE-78",
+    CAT_DESERIALIZATION: "CWE-502", CAT_XSS: "CWE-79", CAT_CRYPTO: "CWE-327",
+    CAT_NETWORK: "CWE-400", CAT_ERROR_HANDLING: "CWE-754", CAT_PATHS: "CWE-22",
+    CAT_MEMORY: "CWE-401", CAT_DANGEROUS: "CWE-95", CAT_ASSERT: "CWE-617",
+    CAT_FILES: "CWE-732", CAT_OBFUSCATION: "CWE-506", CAT_LOGIC: "CWE-480",
+    CAT_RESOURCES: "CWE-772", CAT_TAINT: "CWE-20",
+}
+
+JS_NEW_PATTERNS = [
+    (r'localStorage\.setItem\s*\(\s*["\'](?:token|jwt|auth|key|secret)',
+     "Токен в `localStorage` — уязвим к XSS", "HIGH", CAT_XSS),
+    (r'sessionStorage\.setItem\s*\(\s*["\'](?:token|jwt|auth|key)',
+     "Токен в `sessionStorage` — уязвим к XSS", "HIGH", CAT_XSS),
+    (r'\.then\s*\([^)]*\)\s*;', "`.then()` без `.catch()` — необработанная ошибка", "MEDIUM", CAT_ERROR_HANDLING),
+    (r'fetch\s*\([^)]*\)(?!\s*\.catch)', "`fetch()` без `.catch()` — необработанная ошибка", "MEDIUM", CAT_ERROR_HANDLING),
+    (r'JSON\.parse\s*\([^)]+\)(?!\s*\)\s*\}?\s*catch)', "`JSON.parse()` без `try/catch` — упадёт на невалидном JSON", "MEDIUM", CAT_ERROR_HANDLING),
+    (r'setInterval\s*\([^)]*\)', "`setInterval` без `clearInterval` — утечка памяти", "MEDIUM", CAT_MEMORY),
+    (r'\.length\s*==\s*0', "`.length == 0` — используй `!arr.length`", "LOW", CAT_STYLE),
+    (r'for\s*\(\s*var\s+\w+\s*=\s*0\s*;\s*\w+\s*<\s*\w+\.length', "Кэшируй `.length` в цикле — быстрее", "LOW", CAT_STYLE),
+    (r'\bnew\s+Array\s*\(', "`new Array()` — используй `[]`", "LOW", CAT_STYLE),
+    (r'\bnew\s+Object\s*\(', "`new Object()` — используй `{}`", "LOW", CAT_STYLE),
+    (r'\.substring\s*\(', "`.substring()` — используй `.slice()` (стабильнее)", "LOW", CAT_STYLE),
+    (r'\bdocument\.all\b', "`document.all` — устарело", "MEDIUM", CAT_STYLE),
+    (r'\bwindow\.event\b', "`window.event` — устарело, передавай event явно", "MEDIUM", CAT_STYLE),
+]
+
+CPP_NEW_PATTERNS = [
+    (r'\bstd::endl\b', "`std::endl` — используй `\\n` (быстрее, не сбрасывает буфер)", "MEDIUM", CAT_STYLE),
+    (r'\bendl\b(?!::)', "`endl` — используй `\\n`", "MEDIUM", CAT_STYLE),
+    (r'\bstd::string\s+\w+\s*=\s*"[^"]*"\s*\+\s*\w+', "Конкатенация строк — используй `+=` или `ostringstream`", "LOW", CAT_STYLE),
+    (r'\bprintf\s*\([^)]*%s[^)]*\)', "`printf` с `%s` — используй `std::cout` или `fmt`", "LOW", CAT_STYLE),
+    (r'\bNULL\b(?!\s*\))', "`NULL` — используй `nullptr`", "LOW", CAT_STYLE),
+    (r'\bthrow\s+\w+\s*\(\s*\)', "`throw` объекта без причины — бросай `std::runtime_error`", "MEDIUM", CAT_ERROR_HANDLING),
+    (r'\bcatch\s*\(\s*std::exception\s+\w+\s*\)', "Лови `std::exception` по ссылке (`const std::exception&`)", "MEDIUM", CAT_ERROR_HANDLING),
+    (r'\bfor\s*\(\s*\w+\s+\w+\s*:\s*\w+\s*\)', "Range-based for — убедись, что не копируешь (используй `const&`)", "LOW", CAT_STYLE),
+    (r'\bstd::map\s*<\s*\w+\s*,\s*\w+\s*>', "`std::map` — если не нужен порядок, используй `std::unordered_map`", "LOW", CAT_STYLE),
+    (r'\bnew\s+\w+\s*\[', "`new[]` — используй `std::vector` или `std::array`", "MEDIUM", CAT_MEMORY),
+    (r'\bdelete\s*\[\s*\]', "`delete[]` — если используешь, парь с `new[]`", "LOW", CAT_MEMORY),
+    (r'\bstd::vector\s*<\s*\w+\s*>\s*\w+\s*\(\s*\d+\s*\)', "`vector(n)` создаёт n элементов — для резерва используй `reserve`", "LOW", CAT_STYLE),
+]
+
+GO_NEW_PATTERNS = [
+    (r'http\.Client\s*\{\s*\}', "`http.Client{}` без `Timeout` — может зависнуть", "HIGH", CAT_NETWORK),
+    (r'InsecureSkipVerify\s*:\s*true', "`InsecureSkipVerify: true` — отключает проверку сертификатов", "CRITICAL", CAT_NETWORK),
+    (r'\bcrypto/md5\b', "`crypto/md5` — устаревший хеш, используй sha256+", "MEDIUM", CAT_CRYPTO),
+    (r'\bcrypto/sha1\b', "`crypto/sha1` — устаревший хеш, используй sha256+", "MEDIUM", CAT_CRYPTO),
+    (r'\bcrypto/des\b', "`crypto/des` — устаревший шифр, используй AES", "HIGH", CAT_CRYPTO),
+    (r'\bcrypto/rc4\b', "`crypto/rc4` — устаревший шифр, используй AES", "HIGH", CAT_CRYPTO),
+    (r'\bpanic\s*\(\s*err\s*\)', "`panic(err)` — используй `log.Fatal` или возвращай ошибку", "MEDIUM", CAT_ERROR_HANDLING),
+    (r'\bgo\s+func\s*\(', "Анонимная горутина — проверь, нет ли утечки", "LOW", CAT_MEMORY),
+    (r'close\s*\(\s*\w+\s*\)', "`close()` канала — убедись, что его не закроют дважды", "MEDIUM", CAT_MEMORY),
+    (r'make\s*\(\s*chan\s+\w+\s*\)', "`make(chan)` без буфера — может заблокироваться навсегда", "MEDIUM", CAT_MEMORY),
+    (r'\binterface\s*\{\s*\}', "`interface{}` — используй `any` (Go 1.18+)", "LOW", CAT_STYLE),
+    (r'\berrors\.New\s*\(\s*["\'][^"\']*["\']\s*\)', "`errors.New` со строкой — используй `fmt.Errorf` с `%w`", "LOW", CAT_ERROR_HANDLING),
 ]
 
 PY_INSECURE_KW = {
@@ -183,7 +457,6 @@ CPP_TODO_PATTERNS = [
 CPP_STYLE_PATTERNS = [
     (r'\busing namespace std;', "`using namespace std;` — плохо", "MEDIUM", CAT_STYLE),
     (r'\bprintf\s*\(', "`printf` вместо `std::cout`", "LOW", CAT_STYLE),
-    (r'\bNULL\b', "`NULL` вместо `nullptr`", "LOW", CAT_STYLE),
     (r'\bvoid\s+main\s*\(', "`void main()` — нужно `int main()`", "HIGH", CAT_STYLE),
     (r'\bgoto\s+\w+', "`goto` — плохая практика", "MEDIUM", CAT_STYLE),
     (r'#include\s*<(stdio|stdlib|string|math|time|ctype|errno)\.h>', "`<...h>` вместо `<c...>`", "LOW", CAT_STYLE),
@@ -209,7 +482,6 @@ _CPP_ARRAY_RE = re.compile(
 _CPP_SKIP_VARS = {"return", "if", "while", "for", "else",
                   "switch", "case", "break", "continue"}
 
-# ============ GO ============
 GO_SQL_PATTERNS = [
     (r'db\.(?:Query|QueryRow|Exec)\s*\(\s*fmt\.Sprintf\s*\(', "SQL через fmt.Sprintf"),
     (r'db\.(?:Query|QueryRow|Exec)\s*\(\s*"[^"]*"\s*\+', "SQL через конкатенацию"),
@@ -302,7 +574,6 @@ JS_TODO_PATTERNS = [
     (r'//\s*TODO\b', "TODO"), (r'//\s*FIXME\b', "FIXME"),
     (r'//\s*XXX\b', "XXX"), (r'//\s*HACK\b', "HACK"),
 ]
-
 def _walk_own(node, skip_loops=False):
     yield node
     for child in ast.iter_child_nodes(node):
@@ -329,6 +600,20 @@ def _is_regex_pattern_line(s):
         if meta in s:
             return True
     return False
+
+
+def _looks_like_html_doc(s):
+    """v17.10.2: строка содержит HTML-теги — это документация, а не код.
+
+    Нужна чтобы чекер не ругался на самого себя: в HTML-инструкции
+    (app.py) мы показываем примеры опасных вызовов внутри <code>,
+    <b>, <li> и т.д. — они триггерят проверки, хотя это просто текст.
+    """
+    return bool(re.search(
+        r'</?(?:code|b|i|u|li|ul|ol|p|span|div|a|br|details|summary|h[1-6])(?:\s[^>]*)?>',
+        s,
+        re.IGNORECASE,
+    ))
 
 
 def _looks_like_python(source):
@@ -388,6 +673,18 @@ def _get_language_hint(source):
     if _looks_like_js(source): return "JavaScript"
     if _looks_like_python(source): return "Python"
     return "неизвестный язык"
+
+
+def _get_attr_name(node):
+    """Полное имя ast.Attribute (например 'request.args.get')."""
+    parts = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+    return ".".join(reversed(parts)) if parts else None
 
 
 def _get_call_name(node):
@@ -496,10 +793,8 @@ class PythonChecker(ast.NodeVisitor):
 
     def add(self, line_no, severity, message, category=CAT_OTHER):
         self.problems.append({
-            "line": line_no,
-            "severity": severity,
-            "message": message,
-            "category": category,
+            "line": line_no, "severity": severity,
+            "message": message, "category": category,
         })
 
     def visit_Try(self, node):
@@ -593,21 +888,21 @@ class PythonChecker(ast.NodeVisitor):
             name = alias.asname or alias.name
             self.imports.append((name, node.lineno))
             if alias.name == "*":
-                self.add(node.lineno, "MEDIUM",
-                         "`from ... import *` — неясно.",
-                         CAT_IMPORTS)
+                self.add(node.lineno, "MEDIUM", "`from ... import *` — неясно.", CAT_IMPORTS)
         self.generic_visit(node)
 
     def visit_FunctionDef(self, node):
         self._check_len(node)
         self._check_global(node)
         self._check_return_secret(node)
+        self._check_same_branches(node)
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node):
         self._check_len(node)
         self._check_global(node)
         self._check_return_secret(node)
+        self._check_same_branches(node)
         self.generic_visit(node)
 
     def _check_len(self, node):
@@ -640,18 +935,43 @@ class PythonChecker(ast.NodeVisitor):
                                  "Хардкод секрета в `return` — используй .env",
                                  CAT_SECRETS)
 
+    def _check_same_branches(self, node):
+        for child in _walk_own(node):
+            if isinstance(child, ast.If):
+                if child.orelse:
+                    try:
+                        body_src = ast.unparse(child.body).strip()
+                        orelse_src = ast.unparse(child.orelse).strip()
+                    except Exception:
+                        body_src = ""
+                        orelse_src = ""
+                    if body_src and orelse_src and body_src == orelse_src:
+                        self.add(child.lineno, "HIGH",
+                                 "Одинаковые ветки `if` и `else` — упрости",
+                                 CAT_LOGIC)
+                    if len(child.body) == 1 and len(child.orelse) == 1:
+                        b0 = child.body[0]
+                        o0 = child.orelse[0]
+                        if (isinstance(b0, ast.Return) and isinstance(o0, ast.Return)
+                                and isinstance(b0.value, ast.Constant)
+                                and isinstance(o0.value, ast.Constant)
+                                and isinstance(b0.value.value, bool)
+                                and isinstance(o0.value.value, bool)):
+                            if b0.value.value and not o0.value.value:
+                                self.add(child.lineno, "LOW",
+                                         "`if x: return True; else: return False` — используй `return x`",
+                                         CAT_LOGIC)
+
     def visit_Assert(self, node):
         if not self.is_test:
-            self.add(node.lineno, "HIGH", "`assert` может быть отключён.",
-                     CAT_ASSERT)
+            self.add(node.lineno, "HIGH", "`assert` может быть отключён.", CAT_ASSERT)
         self.generic_visit(node)
 
     def visit_Lambda(self, node):
         body = node.body
         if isinstance(body, (ast.IfExp, ast.Compare, ast.BoolOp,
                               ast.ListComp, ast.DictComp, ast.SetComp)):
-            self.add(node.lineno, "MEDIUM", "`lambda` со сложной логикой.",
-                     CAT_STYLE)
+            self.add(node.lineno, "MEDIUM", "`lambda` со сложной логикой.", CAT_STYLE)
         self.generic_visit(node)
 
     def visit_While(self, node):
@@ -662,8 +982,7 @@ class PythonChecker(ast.NodeVisitor):
                     has_break = True
                     break
             if not has_break:
-                self.add(node.lineno, "MEDIUM", "`while True:` без `break`.",
-                         CAT_STYLE)
+                self.add(node.lineno, "MEDIUM", "`while True:` без `break`.", CAT_STYLE)
         self.generic_visit(node)
 
     def visit_If(self, node):
@@ -680,21 +999,18 @@ class PythonChecker(ast.NodeVisitor):
         if isinstance(test.left, ast.Name) and test.left.id == "__name__":
             for comp in test.comparators:
                 if not (isinstance(comp, ast.Constant) and comp.value == "__main__"):
-                    self.add(node.lineno, "HIGH", "`__name__` не с `__main__`.",
-                             CAT_COMPARISONS)
+                    self.add(node.lineno, "HIGH", "`__name__` не с `__main__`.", CAT_COMPARISONS)
 
     def _check_none(self, test, node):
         if not test.ops: return
         if isinstance(test.ops[0], ast.Eq):
             for comp in test.comparators:
                 if isinstance(comp, ast.Constant) and comp.value is None:
-                    self.add(node.lineno, "HIGH", "`== None` — используй `is None`.",
-                             CAT_COMPARISONS)
+                    self.add(node.lineno, "HIGH", "`== None` — используй `is None`.", CAT_COMPARISONS)
         if isinstance(test.ops[0], ast.NotEq):
             for comp in test.comparators:
                 if isinstance(comp, ast.Constant) and comp.value is None:
-                    self.add(node.lineno, "HIGH", "`!= None` — используй `is not None`.",
-                             CAT_COMPARISONS)
+                    self.add(node.lineno, "HIGH", "`!= None` — используй `is not None`.", CAT_COMPARISONS)
 
     def _check_bool(self, test, node):
         if not test.ops: return
@@ -702,13 +1018,11 @@ class PythonChecker(ast.NodeVisitor):
             for comp in test.comparators:
                 if isinstance(comp, ast.Constant) and isinstance(comp.value, bool):
                     self.add(node.lineno, "HIGH",
-                             f"`== {comp.value}` — используй `if x:`.",
-                             CAT_COMPARISONS)
+                             f"`== {comp.value}` — используй `if x:`.", CAT_COMPARISONS)
 
     def _check_empty_if(self, node):
         if len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
-            self.add(node.lineno, "MEDIUM", "`pass` в `if` — пусто.",
-                     CAT_STYLE)
+            self.add(node.lineno, "MEDIUM", "`pass` в `if` — пусто.", CAT_STYLE)
 
     def visit_Compare(self, node):
         if (isinstance(node.left, ast.Call)
@@ -717,8 +1031,7 @@ class PythonChecker(ast.NodeVisitor):
             for op in node.ops:
                 if isinstance(op, ast.Eq):
                     self.add(node.lineno, "HIGH",
-                             "`type() ==` — используй `isinstance()`.",
-                             CAT_COMPARISONS)
+                             "`type() ==` — используй `isinstance()`.", CAT_COMPARISONS)
         self.generic_visit(node)
 
     def visit_JoinedStr(self, node):
@@ -728,8 +1041,7 @@ class PythonChecker(ast.NodeVisitor):
                 has = True
                 break
         if not has:
-            self.add(node.lineno, "LOW", "f-string без переменных.",
-                     CAT_FSTRINGS)
+            self.add(node.lineno, "LOW", "f-string без переменных.", CAT_FSTRINGS)
         self.generic_visit(node)
 
 
@@ -740,6 +1052,8 @@ def _py_secrets(lines):
         if s.startswith("#") or "# noqa" in line or "# nosec" in line:
             continue
         if _is_regex_pattern_line(s):
+            continue
+        if _looks_like_html_doc(s):
             continue
         found_here = set()
         for pattern, name, gidx in SECRET_PATTERNS:
@@ -775,11 +1089,15 @@ def _py_heuristic_secrets(lines):
             continue
         if _is_regex_pattern_line(s):
             continue
+        if _looks_like_html_doc(s):
+            continue
         m = pattern.match(line)
         if not m:
             continue
         var_name = m.group(1)
         value = m.group(2)
+        if var_name.lower() in SAFE_VAR_NAMES:
+            continue
         if not SECRET_VAR_WORDS.search(var_name):
             continue
         if not _is_random_looking(value):
@@ -787,8 +1105,7 @@ def _py_heuristic_secrets(lines):
         if _is_safe_value(value):
             continue
         problems.append({
-            "line": i,
-            "severity": "CRITICAL",
+            "line": i, "severity": "CRITICAL",
             "message": f"Похоже на хардкод секрета (`{var_name}`) — .env",
             "category": CAT_SECRETS,
         })
@@ -801,6 +1118,8 @@ def _py_sql(lines):
         s = line.strip()
         if s.startswith("#") or "# noqa" in line: continue
         if _is_regex_pattern_line(s):
+            continue
+        if _looks_like_html_doc(s):
             continue
         for pattern, name in PY_SQL_PATTERNS:
             if re.search(pattern, line):
@@ -972,6 +1291,8 @@ def _py_paths(lines):
         if s.startswith("#") or "# noqa" in line: continue
         if _is_regex_pattern_line(s):
             continue
+        if _looks_like_html_doc(s):
+            continue
         for pattern, name in PY_PATH_PATTERNS:
             if re.search(pattern, line):
                 problems.append({"line": i, "severity": "HIGH",
@@ -1000,6 +1321,8 @@ def _py_extra_regex(lines):
         if s.startswith("#") or "# noqa" in line or "# nosec" in line:
             continue
         if _is_regex_pattern_line(s):
+            continue
+        if _looks_like_html_doc(s):
             continue
         for pattern, message in PY_INSECURE_REGEX:
             if re.search(pattern, line):
@@ -1215,9 +1538,14 @@ def _py_empty_except(tree):
             for handler in node.handlers:
                 body = handler.body
                 if len(body) == 1 and isinstance(body[0], ast.Pass):
-                    problems.append({"line": handler.lineno, "severity": "CRITICAL",
-                                     "message": "Пустой `except: pass`.",
-                                     "category": CAT_ERROR_HANDLING})
+                    if handler.type is None:
+                        problems.append({"line": handler.lineno, "severity": "CRITICAL",
+                                         "message": "Голый `except: pass` — ловит ВСЁ и проглатывает.",
+                                         "category": CAT_ERROR_HANDLING})
+                    else:
+                        problems.append({"line": handler.lineno, "severity": "MEDIUM",
+                                         "message": "Пустой `except ...: pass` — ошибка проглатывается.",
+                                         "category": CAT_ERROR_HANDLING})
             self.generic_visit(node)
     Finder().visit(tree)
     return problems
@@ -1231,6 +1559,316 @@ def _py_unused_imports(checker):
                              "message": f"Импорт `{name}` не используется.",
                              "category": CAT_IMPORTS})
     return problems
+
+
+def _py_new_checks(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("#") or "# noqa" in line or "# nosec" in line:
+            continue
+        if s.startswith('"') or s.startswith("'"):
+            continue
+        if _is_regex_pattern_line(s):
+            continue
+        if _looks_like_html_doc(s):
+            continue
+        for pattern, message, severity, category in PY_NEW_INSECURE:
+            try:
+                if re.search(pattern, line):
+                    problems.append({
+                        "line": i, "severity": severity,
+                        "message": message, "category": category,
+                    })
+                    break
+            except re.error:
+                continue
+    return problems
+
+
+def _py_obfuscation_checks(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("#") or "# noqa" in line or "# nosec" in line:
+            continue
+        if s.startswith('"') or s.startswith("'"):
+            continue
+        if _is_regex_pattern_line(s):
+            continue
+        if _looks_like_html_doc(s):
+            continue
+        for pattern, message, severity, category in PY_OBFUSCATION_PATTERNS:
+            try:
+                if re.search(pattern, line):
+                    problems.append({
+                        "line": i, "severity": severity,
+                        "message": message, "category": category,
+                    })
+                    break
+            except re.error:
+                continue
+    return problems
+
+
+def _py_logic_checks(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("#") or "# noqa" in line or "# nosec" in line:
+            continue
+        if s.startswith('"') or s.startswith("'"):
+            continue
+        if _is_regex_pattern_line(s):
+            continue
+        if _looks_like_html_doc(s):
+            continue
+        for pattern, message, severity, category in PY_LOGIC_PATTERNS:
+            try:
+                if re.search(pattern, line):
+                    problems.append({
+                        "line": i, "severity": severity,
+                        "message": message, "category": category,
+                    })
+                    break
+            except re.error:
+                continue
+    return problems
+
+
+def _py_resource_checks(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("#") or "# noqa" in line or "# nosec" in line:
+            continue
+        if s.startswith('"') or s.startswith("'"):
+            continue
+        if _is_regex_pattern_line(s):
+            continue
+        if _looks_like_html_doc(s):
+            continue
+        for pattern, message, severity, category in PY_RESOURCE_PATTERNS:
+            try:
+                if re.search(pattern, line):
+                    problems.append({
+                        "line": i, "severity": severity,
+                        "message": message, "category": category,
+                    })
+                    break
+            except re.error:
+                continue
+    return problems
+
+
+def _py_resource_ast(tree):
+    problems = []
+    with_lines = set()
+
+    class WithCollector(ast.NodeVisitor):
+        def visit_With(self, node):
+            for item in node.items:
+                if isinstance(item.context_expr, ast.Call):
+                    with_lines.add(item.context_expr.lineno)
+            self.generic_visit(node)
+
+        def visit_AsyncWith(self, node):
+            for item in node.items:
+                if isinstance(item.context_expr, ast.Call):
+                    with_lines.add(item.context_expr.lineno)
+            self.generic_visit(node)
+
+    WithCollector().visit(tree)
+
+    class Finder(ast.NodeVisitor):
+        def __init__(self):
+            self.closed_stack = [set()]
+
+        @property
+        def closed_vars(self):
+            return self.closed_stack[-1]
+
+        def _collect_closed(self, node):
+            closed = set()
+            for child in _walk_own(node):
+                if (isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr in ("close", "aclose")
+                        and isinstance(child.func.value, ast.Name)):
+                    closed.add(child.func.value.id)
+            return closed
+
+        def visit_Module(self, node):
+            self.closed_stack[-1] = self._collect_closed(node)
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node):
+            self.closed_stack.append(self._collect_closed(node))
+            self.generic_visit(node)
+            self.closed_stack.pop()
+
+        def visit_AsyncFunctionDef(self, node):
+            self.closed_stack.append(self._collect_closed(node))
+            self.generic_visit(node)
+            self.closed_stack.pop()
+
+        def visit_Assign(self, node):
+            for target in node.targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                for value in ast.walk(node.value):
+                    if isinstance(value, ast.Call):
+                        name = _get_call_name(value)
+                        if name and name in PY_RESOURCE_AST_CALLS:
+                            if value.lineno in with_lines:
+                                continue
+                            if target.id in self.closed_vars:
+                                continue
+                            problems.append({
+                                "line": value.lineno, "severity": "MEDIUM",
+                                "message": PY_RESOURCE_AST_CALLS[name],
+                                "category": CAT_RESOURCES,
+                            })
+            self.generic_visit(node)
+
+    Finder().visit(tree)
+    return problems
+
+
+def _py_taint_analysis(tree):
+    """Отслеживание потока tainted данных от источников до стоков."""
+    problems = []
+
+    class TaintFinder(ast.NodeVisitor):
+        def __init__(self):
+            self.tainted_stack = [set()]
+
+        @property
+        def tainted(self):
+            return self.tainted_stack[-1]
+
+        def _push(self):
+            self.tainted_stack.append(set())
+
+        def _pop(self):
+            if len(self.tainted_stack) > 1:
+                self.tainted_stack.pop()
+
+        def visit_FunctionDef(self, node):
+            self._push()
+            self.generic_visit(node)
+            self._pop()
+
+        def visit_AsyncFunctionDef(self, node):
+            self._push()
+            self.generic_visit(node)
+            self._pop()
+
+        def _is_tainted(self, node):
+            if node is None:
+                return False
+            if isinstance(node, ast.Constant):
+                return False
+            if isinstance(node, ast.Name):
+                return node.id in self.tainted
+            if isinstance(node, ast.Attribute):
+                name = _get_attr_name(node)
+                return name in PY_TAINT_SOURCES
+            if isinstance(node, ast.Subscript):
+                return self._is_tainted(node.value)
+            if isinstance(node, FSTRING_TYPES):
+                for v in node.values:
+                    if isinstance(v, ast.FormattedValue):
+                        if self._is_tainted(v.value):
+                            return True
+                return False
+            if isinstance(node, ast.FormattedValue):
+                return self._is_tainted(node.value)
+            if isinstance(node, ast.BinOp):
+                return self._is_tainted(node.left) or self._is_tainted(node.right)
+            if isinstance(node, ast.Call):
+                name = _get_call_name(node)
+                if name in PY_TAINT_SANITIZERS:
+                    return False
+                if name in PY_TAINT_SOURCES:
+                    return True
+                for arg in node.args:
+                    if self._is_tainted(arg):
+                        return True
+                for kw in node.keywords:
+                    if self._is_tainted(kw.value):
+                        return True
+                return False
+            if isinstance(node, ast.IfExp):
+                return self._is_tainted(node.body) or self._is_tainted(node.orelse)
+            if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+                for el in node.elts:
+                    if self._is_tainted(el):
+                        return True
+                return False
+            return False
+
+        def visit_Assign(self, node):
+            if self._is_tainted(node.value):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        self.tainted.add(t.id)
+                    elif isinstance(t, ast.Tuple):
+                        for elt in t.elts:
+                            if isinstance(elt, ast.Name):
+                                self.tainted.add(elt.id)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node):
+            if node.value and self._is_tainted(node.value):
+                if isinstance(node.target, ast.Name):
+                    self.tainted.add(node.target.id)
+            self.generic_visit(node)
+
+        def visit_Call(self, node):
+            name = _get_call_name(node)
+            if name in PY_TAINT_SINKS:
+                severity, message, category = PY_TAINT_SINKS[name]
+                hit = False
+                for arg in node.args:
+                    if self._is_tainted(arg):
+                        problems.append({
+                            "line": node.lineno, "severity": severity,
+                            "message": message, "category": category,
+                        })
+                        hit = True
+                        break
+                if not hit:
+                    for kw in node.keywords:
+                        if self._is_tainted(kw.value):
+                            problems.append({
+                                "line": node.lineno, "severity": severity,
+                                "message": message, "category": category,
+                            })
+                            break
+            self.generic_visit(node)
+
+    TaintFinder().visit(tree)
+    return problems
+
+
+def _py_category_score(problems):
+    if not problems:
+        return 100
+    total_penalty = 0
+    for p in problems:
+        cat = p.get("category", CAT_OTHER)
+        weight = CATEGORY_WEIGHTS.get(cat, 1)
+        sev = p.get("severity", "LOW")
+        sev_mult = {"CRITICAL": 5, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "INFO": 0}
+        total_penalty += weight * sev_mult.get(sev, 1)
+    score = max(0, int(100 - total_penalty / 10))
+    return score
+
+
+def _py_cwe_for(problem):
+    cat = problem.get("category", CAT_OTHER)
+    return CWE_MAP.get(cat, "")
 
 
 def analyze_python(source, filepath):
@@ -1248,6 +1886,10 @@ def analyze_python(source, filepath):
     problems.extend(_py_paths(lines))
     problems.extend(_py_todo(lines))
     problems.extend(_py_extra_regex(lines))
+    problems.extend(_py_new_checks(lines))
+    problems.extend(_py_obfuscation_checks(lines))
+    problems.extend(_py_logic_checks(lines))
+    problems.extend(_py_resource_checks(lines))
     try:
         tree = ast.parse(source)
     except SyntaxError as e:
@@ -1272,9 +1914,21 @@ def analyze_python(source, filepath):
     problems.extend(_py_unused_imports(checker))
     problems.extend(_py_sql_ast(tree))
     problems.extend(_py_random_heuristic(tree))
-    return _deduplicate(problems)
-
-# ============ C++ ============
+    problems.extend(_py_resource_ast(tree))
+    problems.extend(_py_taint_analysis(tree))
+    for p in problems:
+        cwe = _py_cwe_for(p)
+        if cwe:
+            p["cwe"] = cwe
+    real_problems = [p for p in problems if not p.get("is_score")]
+    score = _py_category_score(real_problems)
+    if problems:
+        problems.append({
+            "line": 0, "severity": "INFO",
+            "message": f"📊 Оценка кода: {score}/100",
+            "category": CAT_OTHER, "is_score": True,
+        })
+    return _deduplicate(problems)# ============ C++ ============
 
 def _cpp_find_string_end(line, start):
     i = start + 1
@@ -1716,6 +2370,16 @@ def analyze_cpp(source, filepath):
     problems.extend(_cpp_malloc_check(lines))
     problems.extend(_cpp_long_lines(lines))
     problems.extend(_cpp_long_functions(lines))
+    for pattern, name, severity, category in CPP_NEW_PATTERNS:
+        for i, line in enumerate(lines, start=1):
+            s = line.strip()
+            if s.startswith("//") or "// noqa" in line:
+                continue
+            if _is_regex_pattern_line(s):
+                continue
+            if re.search(pattern, line):
+                problems.append({"line": i, "severity": severity,
+                                 "message": name, "category": category})
     return _deduplicate(problems)
 
 
@@ -1766,6 +2430,8 @@ def _go_heuristic_secrets(lines):
             continue
         var_name = m.group(1)
         value = m.group(2)
+        if var_name.lower() in SAFE_VAR_NAMES:
+            continue
         if not SECRET_VAR_WORDS.search(var_name):
             continue
         if not _is_random_looking(value):
@@ -1773,8 +2439,7 @@ def _go_heuristic_secrets(lines):
         if _is_safe_value(value):
             continue
         problems.append({
-            "line": i,
-            "severity": "CRITICAL",
+            "line": i, "severity": "CRITICAL",
             "message": f"Похоже на хардкод секрета (`{var_name}`) — .env",
             "category": CAT_SECRETS,
         })
@@ -1885,6 +2550,27 @@ def _go_long_lines(lines):
     return problems
 
 
+def _go_new_checks(lines):
+    problems = []
+    for i, line in enumerate(lines, start=1):
+        s = line.strip()
+        if s.startswith("//") or "// noqa" in line:
+            continue
+        if _is_regex_pattern_line(s):
+            continue
+        for pattern, message, severity, category in GO_NEW_PATTERNS:
+            try:
+                if re.search(pattern, line):
+                    problems.append({
+                        "line": i, "severity": severity,
+                        "message": message, "category": category,
+                    })
+                    break
+            except re.error:
+                continue
+    return problems
+
+
 def analyze_go(source, filepath):
     if not _looks_like_go(source):
         hint = _get_language_hint(source)
@@ -1902,6 +2588,7 @@ def analyze_go(source, filepath):
     problems.extend(_go_paths(lines))
     problems.extend(_go_todo(lines))
     problems.extend(_go_long_lines(lines))
+    problems.extend(_go_new_checks(lines))
     return _deduplicate(problems)
 
 
@@ -1951,19 +2638,22 @@ def _html_todo(lines):
 def _html_scripts_js(source):
     problems = []
     pattern = re.compile(r'<script[^>]*>(.*?)</script>', re.IGNORECASE | re.DOTALL)
+    all_js_patterns = list(JS_PATTERNS) + list(JS_NEW_PATTERNS)
     for m in pattern.finditer(source):
         body = m.group(1)
         if not body.strip(): continue
+        cleaned = re.sub(r'//[^\n]*', '', body)
+        cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
         start_offset = m.start(1)
         start_line = source[:start_offset].count("\n") + 1
-        for pattern_js, name, severity, category in JS_PATTERNS:
-            for mm in re.finditer(pattern_js, body):
-                inner_line = body[:mm.start()].count("\n")
+        for pattern_js, name, severity, category in all_js_patterns:
+            for mm in re.finditer(pattern_js, cleaned):
+                inner_line = cleaned[:mm.start()].count("\n")
                 line_no = start_line + inner_line
                 problems.append({"line": line_no, "severity": severity,
                                  "message": name, "category": category})
-        for mm in JS_EMPTY_CATCH.finditer(body):
-            inner_line = body[:mm.start()].count("\n")
+        for mm in JS_EMPTY_CATCH.finditer(cleaned):
+            inner_line = cleaned[:mm.start()].count("\n")
             line_no = start_line + inner_line
             problems.append({"line": line_no, "severity": "MEDIUM",
                              "message": "Пустой `catch(e) {}`", "category": CAT_ERROR_HANDLING})
@@ -2028,15 +2718,22 @@ def analyze_html(source, filepath):
 
 def _js_check(source):
     problems = []
+    cleaned = re.sub(r'//[^\n]*', '', source)
+    cleaned = re.sub(r'/\*.*?\*/', '', cleaned, flags=re.DOTALL)
     for pattern, name, severity, category in JS_PATTERNS:
-        for m in re.finditer(pattern, source):
-            line_no = source[:m.start()].count("\n") + 1
+        for m in re.finditer(pattern, cleaned):
+            line_no = cleaned[:m.start()].count("\n") + 1
             problems.append({"line": line_no, "severity": severity,
                              "message": name, "category": category})
-    for m in JS_EMPTY_CATCH.finditer(source):
-        line_no = source[:m.start()].count("\n") + 1
+    for m in JS_EMPTY_CATCH.finditer(cleaned):
+        line_no = cleaned[:m.start()].count("\n") + 1
         problems.append({"line": line_no, "severity": "MEDIUM",
                          "message": "Пустой `catch(e) {}`", "category": CAT_ERROR_HANDLING})
+    for pattern, name, severity, category in JS_NEW_PATTERNS:
+        for m in re.finditer(pattern, cleaned):
+            line_no = cleaned[:m.start()].count("\n") + 1
+            problems.append({"line": line_no, "severity": severity,
+                             "message": name, "category": category})
     return problems
 
 
@@ -2116,7 +2813,7 @@ def analyze(filepath):
         try:
             source = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            source = path.read_text(encoding="cp1251")
+            source = path.read_text(encoding="cp1251")  # noqa
     except Exception as e:
         return [{"line": 1, "severity": "CRITICAL",
                  "message": f"Не удалось прочитать: {e}",
