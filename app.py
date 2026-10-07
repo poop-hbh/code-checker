@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Веб-версия Code Checker v16.15. Python + C++ + HTML + JavaScript + Go.
+Веб-версия Code Checker v17.10.2. Python + C++ + HTML + JavaScript + Go.
 Запуск: python app.py
 Открыть: http://127.0.0.1:8000
 
-Изменения:
-  - XSS-фикс (data-* вместо inline onclick)
-  - ZIP: защита от zip-бомб
-  - CORS: whitelist
-  - _zip_collect_files разбит на две функции
-  - Favicon из static/favicon.svg
+Изменения v17.10.2:
+  - Подключена Яндекс.Метрика (счётчик 113541969)
+  - Цели: code_checked, self_check, zip_uploaded,
+          report_downloaded, json_downloaded, report_copied
 """
 
 import asyncio
@@ -24,7 +22,7 @@ import uvicorn
 from pathlib import Path
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles  # ← ДОБАВЛЕНО
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from collections import defaultdict
@@ -42,7 +40,6 @@ logger = logging.getLogger("CodeCheckerWeb")
 
 app = FastAPI(title="Code Checker")
 
-# ← ДОБАВЛЕНО: монтирование папки static (для favicon и других файлов)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -52,6 +49,7 @@ else:
 ALLOWED_ORIGINS = [
     "http://127.0.0.1:8000",
     "http://localhost:8000",
+    "https://code-checker.relaxdev.ru",
 ]
 
 app.add_middleware(
@@ -114,8 +112,21 @@ HTML_PAGE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">  <!-- ← ДОБАВЛЕНО -->
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
     <title>Code Checker — Python + C++ + HTML + JS + Go</title>
+    <!-- Yandex.Metrika counter -->
+    <script type="text/javascript">
+        (function(m,e,t,r,i,k,a){
+            m[i]=m[i]||function(){(m[i].a=m[i].a||[]).push(arguments)};
+            m[i].l=1*new Date();
+            for (var j = 0; j < document.scripts.length; j++) {if (document.scripts[j].src === r) { return; }}
+            k=e.createElement(t),a=e.getElementsByTagName(t)[0],k.async=1,k.src=r,a.parentNode.insertBefore(k,a)
+        })(window, document,'script','https://mc.yandex.ru/metrika/tag.js?id=113541969', 'ym');
+
+        ym(113541969, 'init', {ssr:true, webvisor:true, clickmap:true, ecommerce:"dataLayer", referrer: document.referrer, url: location.href, accurateTrackBounce:true, trackLinks:true});
+    </script>
+    <noscript><div><img src="https://mc.yandex.ru/watch/113541969" style="position:absolute; left:-9999px;" alt="" /></div></noscript>
+    <!-- /Yandex.Metrika counter -->
     <style>
         :root {
             --bg: #0f0f0f;
@@ -576,9 +587,7 @@ HTML_PAGE = """
         }
         .toast.show { opacity: 1; transform: translateY(0); }
     </style>
-</head>
-<body>
-    <header>
+</head><body>    <header>
         <h1>🔍 Code Checker</h1>
         <p>60+ проверок: Python + C++ + HTML + JavaScript + Go</p>
         <div class="lang-switch">
@@ -593,48 +602,86 @@ HTML_PAGE = """
 
     <details class="disclaimer">
         <summary>Как это работает и чего ждать от помощника</summary>
-        <p>Этот помощник — <b>статический анализатор кода</b>. Ищет типовые проблемы по паттернам и эвристике. Работает локально, код никуда не уходит.</p>
 
-        <p><b>Что находит:</b></p>
+        <p>Это <b>как проверка орфографии, только для кода</b>. Вставляешь свой код → жмёшь «Проверить» → видишь список проблем. Никаких настроек, никаких зависимостей — всё работает в браузере.</p>
+
+        <p><b>🚀 Как проверить код — 3 шага:</b></p>
         <ul>
-            <li>Хардкод секретов — пароли, API-ключи, токены (Stripe, AWS, GitHub, OpenAI, JWT и др.)</li>
-            <li>SQL-инъекции — f-строки, конкатенация, %-формат, <code>fmt.Sprintf</code> в Go</li>
-            <li>Shell-инъекции — os.system, subprocess, <code>exec.Command("sh", "-c", ...)</code></li>
-            <li>XSS — eval, innerHTML, outerHTML, document.write, inline-обработчики</li>
-            <li>Опасные функции — eval, exec, pickle.load, yaml.load без SafeLoader, XXE</li>
-            <li>HTTP без timeout — <code>http.Get</code>, <code>http.Post</code> в Go</li>
-            <li>Устаревшие хеши — md5, sha1</li>
-            <li>Хардкод путей — Windows и Linux</li>
-            <li>Стилевые проблемы — длинные функции, TODO/FIXME, global, lambda, panic()</li>
-            <li>Эвристика по имени переменной — если имя содержит TOKEN/KEY/SECRET/PASS</li>
+            <li><b>1.</b> Вставь код в левое окно (или перетащи файл — он сам подхватится)</li>
+            <li><b>2.</b> Нажми <code>Проверить</code> или <code>Ctrl+Enter</code></li>
+            <li><b>3.</b> Смотри отчёт справа — проблемы сгруппированы по важности</li>
         </ul>
 
-        <p><b>Что НЕ находит:</b></p>
+        <p><b>🎨 Что значат цвета в отчёте:</b></p>
         <ul>
-            <li>Логические ошибки — гонки, deadlock, неверные условия</li>
-            <li>Сложные утечки памяти</li>
-            <li>Архитектурные проблемы и проблемы между файлами</li>
-            <li>Обфускацию (chr/ord, цепочки base64 → exec)</li>
-            <li>Подмену builtins через setattr, метаклассы, рефлексию</li>
-            <li>Целенаправленный обход правил</li>
+            <li>🔴 <b>Критично</b> — дыра в безопасности, чинить срочно (например, пароль в коде)</li>
+            <li>🟡 <b>Высоко</b> — серьёзная проблема, желательно чинить (например, SQL-инъекция)</li>
+            <li>🟠 <b>Средне</b> — стоит посмотреть (например, <code>open()</code> без <code>with</code>)</li>
+            <li>⚪ <b>Низко</b> — стиль и мелочи (длинная функция, TODO)</li>
+            <li>ℹ️ <b>Инфо</b> — заметка или оценка кода (не проблема)</li>
         </ul>
 
-        <p><b>Как пользоваться:</b></p>
+        <p><b>✅ Что находит:</b></p>
         <ul>
-            <li><b>📁 Файл</b> — выбрать файл. Язык по расширению. Больше 100 000 символов — обрежется.</li>
-            <li><b>📦 ZIP</b> — проверить весь проект. Пропускает <code>node_modules/</code>, <code>.git/</code>, <code>__pycache__/</code> + применяет <code>.checkerignore</code>. Лимиты: 5 МБ, 100 файлов.</li>
-            <li><b>🚫 Игнор</b> — редактировать <code>.checkerignore</code> (как <code>.gitignore</code>).</li>
-            <li><b>Drag &amp; drop</b> — перетащи файл в поле.</li>
-            <li><b>Проверить</b> — запускает анализ. <code>Ctrl+Enter</code>.</li>
-            <li><b>🗑 Очистить</b> — сброс. <code>Ctrl+L</code>.</li>
-            <li><b>📜 История</b> — последние 10 проверок.</li>
-            <li><b>📋 Копировать / 📥 TXT / 📋 JSON</b> — экспорт отчёта.</li>
-            <li><b>Клик на проблему</b> — копировать одну строку.</li>
-            <li><b>🔍 Поиск</b> + <b>фильтры</b> — по severity и категориям.</li>
-            <li><b>Esc</b> — закрыть окно.</li>
+            <li><b>Секреты в коде</b> — пароли, API-ключи, токены (Stripe, AWS, GitHub, OpenAI, JWT, Telegram, Slack, Discord и ещё 20+)</li>
+            <li><b>SQL-инъекции</b> — f-строки, конкатенация, %-формат. Плюс <b>цепочки через переменные</b> (прослеживаем данные от <code>request.args</code> до <code>execute()</code>)</li>
+            <li><b>Shell-инъекции (RCE)</b> — <code>os.system</code>, <code>subprocess</code> с <code>shell=True</code>, <code>exec.Command("sh", "-c", ...)</code> в Go</li>
+            <li><b>XSS / SSTI</b> — <code>eval</code>, <code>innerHTML</code>, <code>document.write</code>, <code>render_template_string</code>, Jinja2/Mako без санитайза</li>
+            <li><b>Обфускация</b> — <code>exec(base64...)</code>, <code>exec(chr()+chr())</code>, <code>exec(bytes.fromhex())</code>, rot13</li>
+            <li><b>Подмена builtins</b> — <code>setattr(builtins, ...)</code>, <code>getattr(__builtins__, ...)</code>, <code>globals()[]</code></li>
+            <li><b>Рефлексия</b> — <code>sys._getframe()</code>, доступ к <code>f_globals</code>/<code>f_locals</code>, <code>inspect.get*()</code></li>
+            <li><b>Опасные функции</b> — <code>pickle.load</code>, <code>yaml.load</code> без SafeLoader, XXE, <code>marshal.load</code></li>
+            <li><b>Framework-специфика</b> — Django (<code>mark_safe</code>, <code>@csrf_exempt</code>, <code>.raw()</code>), Flask (<code>debug=True</code>, <code>send_file</code>), SQLAlchemy (<code>text()</code>)</li>
+            <li><b>SSRF</b> — URL из переменной в <code>requests.get()</code></li>
+            <li><b>Утечки ресурсов</b> — <code>Session</code>, <code>socket</code>, <code>sqlite3</code>, файлы без <code>with</code></li>
+            <li><b>Слабую криптографию</b> — <code>md5</code>, <code>sha1</code>, <code>random</code> для токенов</li>
+            <li><b>Хардкод путей</b> — <code>C:\\...</code>, <code>/etc/...</code> (не работает на другом ПК)</li>
+            <li><b>Обработку ошибок</b> — голый <code>except:</code>, пустой <code>except: pass</code></li>
+            <li><b>Стиль и логику</b> — длинные функции, <code>== None</code>, <code>if x == True</code>, <code>x = x</code>, мёртвый код</li>
+            <li><b>C++</b> — <code>strcpy</code>, <code>gets</code>, <code>sprintf</code>, use-after-free, возврат локальной переменной</li>
+            <li><b>Go</b> — <code>http.Get</code> без timeout, <code>InsecureSkipVerify</code>, утечки горутин, <code>math/rand</code> для крипто</li>
+            <li><b>JavaScript</b> — <code>eval</code>, <code>new Function</code>, токены в <code>localStorage</code>, <code>==</code> вместо <code>===</code></li>
+            <li><b>HTML</b> — <code>iframe</code> без <code>sandbox</code>, mixed content, <code>javascript:</code> в ссылках</li>
         </ul>
 
-        <p class="warn">💡 0 проблем ≠ идеальный код. Помощник — это первый фильтр, а не замена ревью и аудиту.</p>
+        <p><b>🎁 Бонус — умный taint-анализ:</b></p>
+        <p>Помощник <b>прослеживает данные</b> от источника до опасного места. Например:</p>
+        <ul>
+            <li><code>x = request.args.get("id")</code> → источник</li>
+            <li><code>q = "SELECT ... " + x</code> → данные текут</li>
+            <li><code>execute(q)</code> → сток 🔴 <b>найдено!</b></li>
+        </ul>
+        <p>И знает <b>санитайзеры</b>: если ты обернул вход в <code>int()</code>, <code>escape()</code>, <code>shlex.quote()</code> — тревоги не будет, потому что данные безопасны.</p>
+
+        <p><b>❌ Что НЕ находит:</b></p>
+        <ul>
+            <li><b>Логические ошибки</b> — гонки, deadlock, неверные условия (нужен человек)</li>
+            <li><b>Алгоритмические баги</b> — неправильная формула, потеря точности</li>
+            <li><b>Архитектуру</b> — проблемы между файлами, мёртвый код (пока не умеем)</li>
+            <li><b>Целенаправленный обход</b> — если специально хитро спрятал уязвимость</li>
+            <li><b>Runtime-проблемы</b> — что вылезает только при запуске (гонки, утечки памяти в динамике)</li>
+            <li><b>Производительность</b> — медленные алгоритмы, лишние копирования</li>
+        </ul>
+
+        <p><b>⚙️ Как читать отчёт:</b></p>
+        <ul>
+            <li><b>Кликни на проблему</b> — скопируется в буфер одной строкой</li>
+            <li><b>Фильтры сверху</b> — по важности (🔴 🟡 🟠 ⚪) и по категории (секреты, SQL, XSS...)</li>
+            <li><b>Поиск 🔍</b> — ищет по тексту проблемы</li>
+            <li><b>📋 Копировать / 📥 TXT / 📋 JSON</b> — экспорт всего отчёта</li>
+            <li><b>📜 История</b> — последние 10 проверок (только в твоём браузере)</li>
+        </ul>
+
+        <p><b>🛠️ Продвинутое (для любопытных):</b></p>
+        <ul>
+            <li><b>📁 Файл</b> — загрузить один файл. Язык определяется по расширению</li>
+            <li><b>📦 ZIP</b> — проверить весь проект. Пропускает <code>node_modules/</code>, <code>.git/</code>, <code>__pycache__/</code>. Лимиты: 5 МБ, 100 файлов</li>
+            <li><b>🚫 Игнор</b> — редактировать <code>.checkerignore</code> (формат как <code>.gitignore</code>)</li>
+            <li><b>🪞 Проверить себя</b> — прогнать сам анализатор (для любопытных)</li>
+            <li><b>Ctrl+Enter</b> — проверить · <b>Ctrl+L</b> — очистить · <b>Ctrl+S</b> — скачать · <b>Esc</b> — закрыть окно</li>
+        </ul>
+
+        <p class="warn">💡 0 проблем ≠ идеальный код. Помощник — это <b>первый фильтр</b>, а не замена ревью и аудиту. Он ловит <b>типовые</b> проблемы, но <b>не заменяет</b> голову программиста. Проверь код вручную — особенно логику, архитектуру и работу с данными.</p>
     </details>
 
     <main>
@@ -775,13 +822,18 @@ HTML_PAGE = """
             'line_length': '📏 Длина строк',
             'memory': '💾 Память',
             'xss': '🎯 XSS',
+            'obfuscation': '🕵️ Обфускация',
+            'logic': '🧠 Логика',
+            'resources': '🔋 Ресурсы',
+            'taint': '🌊 Taint-анализ',
             'other': '📌 Прочее'
         };
         var CATEGORY_ORDER = [
             'secrets', 'sql', 'shell', 'dangerous_calls', 'deserialization',
             'crypto', 'error_handling', 'assert', 'files', 'network',
             'paths', 'comparisons', 'style', 'notes', 'imports',
-            'logging', 'fstrings', 'line_length', 'memory', 'xss', 'other'
+            'logging', 'fstrings', 'line_length', 'memory', 'xss',
+            'obfuscation', 'logic', 'resources', 'taint', 'other'
         ];
 
         var toastTimer = null;
@@ -1026,6 +1078,7 @@ HTML_PAGE = """
                 }
 
                 var data = await res.json();
+                if (typeof ym === 'function') { ym(113541969, 'reachGoal', 'zip_uploaded'); }
 
                 if (data.error) {
                     resultEl.innerHTML = '<div class="error">' + escapeHtml(data.error) + '</div>';
@@ -1351,8 +1404,8 @@ HTML_PAGE = """
                 container.innerHTML =
                     '<div class="no-problems">' +
                     '<b>✅ Критичных проблем не найдено.</b><br><br>' +
-                    'Это <b>не значит</b>, что код идеален. Помощник проверяет <b>60+ типовых</b> проблем ' +
-                    'по паттернам и эвристике. Он <b>не заменяет</b> ревью человеком и аудит. ' +
+                    'Это <b>не значит</b>, что код идеален. Помощник ловит <b>типовые</b> проблемы ' +
+                    'по паттернам, эвристике и taint-анализу, но <b>не заменяет</b> ревью человеком и аудит. ' +
                     'Проверь код вручную — особенно логику, архитектуру и работу с данными.' +
                     '</div>';
                 copyBtn.disabled = true;
@@ -1519,6 +1572,7 @@ HTML_PAGE = """
                 }
 
                 var data = await res.json();
+                if (typeof ym === 'function') { ym(113541969, 'reachGoal', 'code_checked'); }
                 var srcName = currentFileName || LANG_NAMES[currentLang] || 'код';
                 renderProblems(data, resultEl, srcName);
                 if (data.problems && data.problems.length > 0) {
@@ -1556,6 +1610,7 @@ HTML_PAGE = """
                 }
 
                 var data = await res.json();
+                if (typeof ym === 'function') { ym(113541969, 'reachGoal', 'self_check'); }
                 if (!data.results) {
                     resultEl.innerHTML = '<div class="error">Сервер вернул неверный ответ.</div>';
                     return;
@@ -1640,6 +1695,7 @@ HTML_PAGE = """
         async function copyReport() {
             var text = buildReportText();
             if (!text) return;
+            if (typeof ym === 'function') { ym(113541969, 'reachGoal', 'report_copied'); }
             await copyToClipboard(text);
             copyBtn.textContent = '✅ Скопировано!';
             copyBtn.classList.add('copied');
@@ -1653,6 +1709,7 @@ HTML_PAGE = """
         function downloadReport() {
             var text = buildReportText();
             if (!text) return;
+            if (typeof ym === 'function') { ym(113541969, 'reachGoal', 'report_downloaded'); }
             var d = new Date();
             var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
             var stamp = d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) +
@@ -1672,6 +1729,7 @@ HTML_PAGE = """
 
         function downloadJSON() {
             if (!lastProblems || lastProblems.length === 0) return;
+            if (typeof ym === 'function') { ym(113541969, 'reachGoal', 'json_downloaded'); }
             var counts = { 'CRITICAL': 0, 'HIGH': 0, 'MEDIUM': 0, 'LOW': 0, 'INFO': 0 };
             for (var i = 0; i < lastProblems.length; i++) {
                 var sev = lastProblems[i].severity;
@@ -1679,7 +1737,7 @@ HTML_PAGE = """
             }
             var report = {
                 tool: 'Code Checker',
-                version: 'v16.15',
+                version: 'v17.10.2',
                 date: new Date().toISOString(),
                 source: lastSourceName,
                 language: currentLang,
@@ -1727,8 +1785,6 @@ HTML_PAGE = """
 </body>
 </html>
 """
-
-
 # ============ .checkerignore ============
 
 def _load_checkerignore():
